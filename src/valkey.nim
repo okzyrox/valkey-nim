@@ -35,7 +35,7 @@
 ##
 ##    waitFor main()
 
-import std/net, asyncdispatch, asyncnet, os, strutils, parseutils, deques, options
+import std/net, asyncdispatch, asyncnet, os, strutils, parseutils, deques, options, sets
 
 const
   valkeyNil* = "\0\0"
@@ -120,6 +120,17 @@ type
     params*: ValkeyConnParams
     conn*: AsyncValkey             # nil until first subscribe
     ignoreSubscribeMessages*: bool
+
+    channels*: HashSet[string]
+    patterns*: HashSet[string]
+    shardChannels*: HashSet[string]
+
+    pendingUnsubChannels*: HashSet[string]
+    pendingUnsubPatterns*: HashSet[string]
+    pendingUnsubShardChannels*: HashSet[string]
+
+    subscribed*: bool
+    subscribedFut*: Future[void]
 
 proc newPipeline(): Pipeline =
   new(result)
@@ -1251,6 +1262,17 @@ proc pubsub*(c: AsyncValkey; ignoreSubscribeMessages=false): AsyncPubSub =
   result.params = c.params
   result.conn = nil # lazy
   result.ignoreSubscribeMessages = ignoreSubscribeMessages
+
+  result.channels = initHashSet[string]()
+  result.patterns = initHashSet[string]()
+  result.shardChannels = initHashSet[string]()
+
+  result.pendingUnsubChannels = initHashSet[string]()
+  result.pendingUnsubPatterns = initHashSet[string]()
+  result.pendingUnsubShardChannels = initHashSet[string]()
+
+  result.subscribed = false
+  result.subscribedFut = newFuture[void]("pubsub.subscribed")
 
 proc connectValkeyAsync*(host = "localhost", port = 6379.Port, db = 0,
                         username = "", password = ""): Future[AsyncValkey]
