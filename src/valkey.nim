@@ -1315,6 +1315,18 @@ proc executeCommand*(ps: AsyncPubSub; cmd:string; args: varargs[string]): Future
   for a in args: argv.add a
   return ps.executeCommandImpl(argv)
 
+proc updateSubscribed*(ps: AsyncPubSub): void =
+  let now = ps.channels.len > 0 or ps.patterns.len > 0 or ps.shardChannels.len > 0
+  if now == ps.subscribed:
+    return
+
+  ps.subscribed = now
+  if now:
+    if not ps.subscribedFut.finished:
+      ps.subscribedFut.complete()
+  else:
+    ps.subscribedFut = newFuture[void]("pubsub.subscribed")
+
 proc subscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
   var argv: seq[string] = @["SUBSCRIBE"]
   for c in channels: argv.add c
