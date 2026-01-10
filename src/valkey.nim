@@ -1348,15 +1348,47 @@ proc subscribeImpl(ps: AsyncPubSub; channels: seq[string]): Future[void] {.async
 proc subscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
   return ps.subscribeImpl(@channels)
 
+proc psubscribeImpl(ps: AsyncPubSub; patterns: seq[string]): Future[void] {.async.}  =
+  let uniquePatterns = patterns.deduplicate()
+
+  if uniquePatterns.len == 0:
+    raise newException(ValueError, "PSUBSCRIBE needs at least one pattern")
+
+  var argv = newSeqOfCap[string](1 + uniquePatterns.len)
+  argv.add "PSUBSCRIBE"
+  for p in uniquePatterns: argv.add p
+
+  await ps.executeCommand(argv)
+
+  for p in uniquePatterns:
+    ps.patterns.incl(p)
+    ps.pendingUnsubPatterns.excl(p)
+
+  ps.updateSubscribed()
+
 proc psubscribe*(ps: AsyncPubSub; pattern: varargs[string]): Future[void] =
-  var argv: seq[string] = @["PSUBSCRIBE"]
-  for p in pattern: argv.add p
-  return ps.executeCommand(argv)
+  return ps.psubscribeImpl(@pattern)
+
+proc ssubscribeImpl(ps: AsyncPubSub; channels: seq[string]): Future[void] {.async.}  =
+  let uniqueChannels = channels.deduplicate()
+
+  if uniqueChannels.len == 0:
+    raise newException(ValueError, "SSUBSCRIBE needs at least one channel")
+
+  var argv = newSeqOfCap[string](1 + uniqueChannels.len)
+  argv.add "SSUBSCRIBE"
+  for c in uniqueChannels: argv.add c
+
+  await ps.executeCommand(argv)
+
+  for c in uniqueChannels:
+    ps.shardChannels.incl(c)
+    ps.pendingUnsubShardChannels.excl(c)
+
+  ps.updateSubscribed()
 
 proc ssubscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
-  var argv: seq[string] = @["SSUBSCRIBE"]
-  for c in channels: argv.add c
-  return ps.executeCommand(argv)
+  return ps.ssubscribeImpl(@channels)
 
 proc unsubscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
   if channels.len == 0:
