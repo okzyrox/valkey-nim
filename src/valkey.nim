@@ -1477,6 +1477,47 @@ proc parseEvent*(response: openArray[string]): Option[PubSubEvent] =
   else:
     return none(PubSubEvent)
 
+proc subKey(ev : PubSubEvent): string =
+  if ev.pattern.len > 0: ev.pattern else: ev.channel
+
+proc applyState(ps: AsyncPubSub; ev: PubSubEvent): void =
+  let key = subKey(ev)
+  if key.len == 0: return
+
+  case ev.kind
+  of pekSubscribe:
+    ps.channels.incl(key)
+    ps.pendingUnsubChannels.excl(key)
+    ps.updateSubscribed()
+
+  of pekUnsubscribe:
+    ps.channels.excl(key)
+    ps.pendingUnsubChannels.excl(key)
+    ps.updateSubscribed()
+
+  of pekPSubscribe:
+    ps.patterns.incl(key)
+    ps.pendingUnsubPatterns.excl(key)
+    ps.updateSubscribed()
+
+  of pekPUnsubscribe:
+    ps.patterns.excl(key)
+    ps.pendingUnsubPatterns.excl(key)
+    ps.updateSubscribed()
+
+  of pekSSubscribe:
+    ps.shardChannels.incl(key)
+    ps.pendingUnsubShardChannels.excl(key)
+    ps.updateSubscribed()
+
+  of pekSUnsubscribe:
+    ps.shardChannels.excl(key)
+    ps.pendingUnsubShardChannels.excl(key)
+    ps.updateSubscribed()
+
+  else:
+    # no state change for other event kinds
+    discard
 
 proc handleMessage*(ps: AsyncPubSub; frame: RedisList): Option[PubSubEvent] =
   let eventOpt = parseEvent(frame)
@@ -1488,6 +1529,9 @@ proc handleMessage*(ps: AsyncPubSub; frame: RedisList): Option[PubSubEvent] =
      pekPSubscribe, pekPUnsubscribe,
      pekSSubscribe, pekSUnsubscribe
   }
+  if isSubCtl:
+    ps.applyState(event)
+
   if isSubCtl and ps.ignoreSubscribeMessages:
     return none(PubSubEvent)
   return some(event)
