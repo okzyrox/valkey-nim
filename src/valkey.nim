@@ -1315,6 +1315,11 @@ proc executeCommand*(ps: AsyncPubSub; cmd:string; args: varargs[string]): Future
   for a in args: argv.add a
   return ps.executeCommandImpl(argv)
 
+proc waitSubscribed*(ps: AsyncPubSub): Future[void] =
+  ## Completes once the pubsub instance has at least one active subscription
+  ## Resets with new future when subscriptions drop back to zero.
+  ps.subscribedFut
+
 proc updateSubscribed*(ps: AsyncPubSub): void =
   let now = ps.channels.len > 0 or ps.patterns.len > 0 or ps.shardChannels.len > 0
   if now == ps.subscribed:
@@ -1343,8 +1348,6 @@ proc subscribeImpl(ps: AsyncPubSub; channels: seq[string]): Future[void] {.async
     ps.channels.incl(c)
     ps.pendingUnsubChannels.excl(c)
 
-  ps.updateSubscribed()
-
 proc subscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
   return ps.subscribeImpl(@channels)
 
@@ -1364,8 +1367,6 @@ proc psubscribeImpl(ps: AsyncPubSub; patterns: seq[string]): Future[void] {.asyn
     ps.patterns.incl(p)
     ps.pendingUnsubPatterns.excl(p)
 
-  ps.updateSubscribed()
-
 proc psubscribe*(ps: AsyncPubSub; pattern: varargs[string]): Future[void] =
   return ps.psubscribeImpl(@pattern)
 
@@ -1384,8 +1385,6 @@ proc ssubscribeImpl(ps: AsyncPubSub; channels: seq[string]): Future[void] {.asyn
   for c in uniqueChannels:
     ps.shardChannels.incl(c)
     ps.pendingUnsubShardChannels.excl(c)
-
-  ps.updateSubscribed()
 
 proc ssubscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
   return ps.ssubscribeImpl(@channels)
