@@ -35,7 +35,7 @@
 ##
 ##    waitFor main()
 
-import std/net, asyncdispatch, asyncnet, os, strutils, parseutils, deques, options, sets
+import std/net, asyncdispatch, asyncnet, os, strutils, parseutils, deques, options, sets, sequtils
 
 const
   valkeyNil* = "\0\0"
@@ -1327,10 +1327,26 @@ proc updateSubscribed*(ps: AsyncPubSub): void =
   else:
     ps.subscribedFut = newFuture[void]("pubsub.subscribed")
 
+proc subscribeImpl(ps: AsyncPubSub; channels: seq[string]): Future[void] {.async.}  =
+  let uniqueChannels = channels.deduplicate()
+
+  if uniqueChannels.len == 0:
+    raise newException(ValueError, "SUBSCRIBE needs at least one channel")
+
+  var argv = newSeqOfCap[string](1 + uniqueChannels.len)
+  argv.add "SUBSCRIBE"
+  for c in uniqueChannels: argv.add c
+
+  await ps.executeCommand(argv)
+
+  for c in uniqueChannels:
+    ps.channels.incl(c)
+    ps.pendingUnsubChannels.excl(c)
+
+  ps.updateSubscribed()
+
 proc subscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
-  var argv: seq[string] = @["SUBSCRIBE"]
-  for c in channels: argv.add c
-  return ps.executeCommand(argv)
+  return ps.subscribeImpl(@channels)
 
 proc psubscribe*(ps: AsyncPubSub; pattern: varargs[string]): Future[void] =
   var argv: seq[string] = @["PSUBSCRIBE"]
