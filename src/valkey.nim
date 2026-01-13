@@ -132,6 +132,8 @@ type
     subscribed*: bool
     subscribedFut*: Future[void]
 
+    pendingPing: int
+
 proc newPipeline(): Pipeline =
   new(result)
   result.buffer = ""
@@ -1519,9 +1521,26 @@ proc applyState(ps: AsyncPubSub; ev: PubSubEvent): void =
     discard
 
 proc handleMessage*(ps: AsyncPubSub; frame: RedisList): Option[PubSubEvent] =
+  if frame.len == 0: return none(PubSubEvent)
+
   let eventOpt = parseEvent(frame)
-  if eventOpt.isNone: return none(PubSubEvent)
+
+  # Scalar replies (non-subscribed PING) arrive as @["..."]
+  if eventOpt.isNone:
+    if not ps.subscribed and ps.pendingPing > 0 and frame.len == 1:
+      dec ps.pendingPing
+      let s = frame[0]
+      if s.cmpIgnoreCase("PONG") == 0:
+        return some(PubSubEvent(kind: pekPong, data: ""))
+      else:
+        return some(PubSubEvent(kind: pekPong, data: s))
+    return none(PubSubEvent)
+
   let event = eventOpt.get()
+
+  # Pubsub mode : ["pong"] or ["pong", data]
+  if event.kind == pekPong and ps.pendingPing > 0:
+    dec ps.pendingPing
 
   let isSubCtl = event.kind in {
      pekSubscribe, pekUnsubscribe,
@@ -1640,6 +1659,14 @@ proc ping*(r: Redis | AsyncRedis): Future[RedisStatus] {.multisync.} =
   ## Ping the server
   await r.sendCommand("PING")
   result = await r.readStatus()
+
+proc ping*(ps: AsyncPubSub; payload = ""): Future[void] {.async.} =
+  await ps.ensureConn()
+  inc ps.pendingPing
+  if payload.len == 0:
+    await ps.executeCommand("PING")
+  else:
+    await ps.executeCommand("PING", payload)
 
 proc close*(ps: AsyncPubSub): Future[void] {.async.} =
   ## Pub/Sub connection close (disconnect)
