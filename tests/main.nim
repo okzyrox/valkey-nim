@@ -176,7 +176,7 @@ suite "valkey async tests":
 
     check waitFor main()
 
-  test "pub/sub":
+  test "pub/sub legacy":
 
     proc main() {.async.} =
       let sub = await connectTest(AsyncValkey)
@@ -241,16 +241,24 @@ suite "valkey async tests":
       doAssert ps.conn.isNil
 
       let ch = "test_pubsub_sub_ack"
-      await ps.subscribe(ch)
+
+      # duplicates should be deduped to one subscribe ack
+      await ps.subscribe(ch, ch, ch)
       doAssert ps.conn.isNil == false
 
-      let fut = ps.parseResponse()
-      let frame = await fut
+      # until ack is consumed, subscribe should be false
+      doAssert ps.subscribed == false
+
+      let frame = await ps.parseResponse()
 
       doAssert frame.len == 3
       doAssert frame[0] == "subscribe"
       doAssert frame[1] == ch
       doAssert frame[2] == "1"
+
+      let ev = ps.handleMessage(frame)
+      doAssert ev.isSome
+      doAssert ps.subscribed == true
 
       await ps.close()
       await base.close()
@@ -329,15 +337,45 @@ suite "valkey async tests":
       let base = await connectTest(AsyncValkey)
       let ps = base.pubsub(ignoreSubscribeMessages = false)
 
-      await ps.executeCommand("PING")
+      # unsubscribed scalar ping
+      await ps.ping()
 
-      let fut = ps.receiveEvent()
+      var fut = ps.receiveEvent()
       doAssert await withTimeout(fut, 2000)
       let ev = await fut
 
       doAssert ev.kind == pekPong
       doAssert ev.data == ""
       doAssert ev.channel == ""
+
+      # unsubscribed ping with payload
+      let payload = "hello"
+      await ps.ping(payload)
+
+      var futp =  ps.receiveEvent()
+      doAssert await withTimeout(futp, 2000)
+      let evp = await futp
+
+      doAssert evp.kind == pekPong
+      doAssert evp.data == payload
+      doAssert evp.channel == ""
+
+      # subscribed ping
+      let ch = "test_pubsub_ping"
+      await ps.subscribe(ch)
+
+      fut = ps.receiveEvent()
+      doAssert await withTimeout(fut, 2000)
+      discard await fut  # consume subscribe ack
+
+      await ps.ping()
+
+      fut  = ps.receiveEvent()
+      doAssert await withTimeout(fut, 2000)
+      let ev2 = await fut
+      doAssert ev2.kind == pekPong
+      doAssert ev2.data == ""
+      doAssert ev2.channel == ""
 
       await ps.close()
       await base.close()
@@ -353,9 +391,19 @@ suite "valkey async tests":
       let ch1 = "test_unsub_1"
       let ch2 = "test_unsub_2"
 
+      # waitSubscribed shouldn't be finished yet
+      let subFut0 = ps.waitSubscribed()
+      doAssert subFut0.finished == false
+      doAssert ps.subscribed == false
+
       await ps.subscribe(ch1, ch2)
 
+      # consume ack 1
       discard await ps.receiveEvent()
+      doAssert ps.subscribed == true
+      doAssert subFut0.finished == true
+
+      # consume ack 2
       discard await ps.receiveEvent()
 
       await ps.unsubscribe(ch1)
@@ -364,6 +412,26 @@ suite "valkey async tests":
       doAssert ev.kind == pekUnsubscribe
       doAssert ev.channel == ch1
       doAssert ev.data == "1"
+
+      # still subscribed to ch2
+      doAssert ps.subscribed == true
+
+      # unsubscribe from ch2 and make sure the subscribed resets
+      let subFut1 = ps.waitSubscribed()
+      doAssert subFut0.finished == true
+      doAssert subFut1 == subFut0
+
+      await ps.unsubscribe(ch2)
+      let ev2 = await ps.receiveEvent()
+      doAssert ev2.kind == pekUnsubscribe
+      doAssert ev2.channel == ch2
+      doAssert ev2.data == "0"
+
+      doAssert ps.subscribed == false
+
+      let subFut2 = ps.waitSubscribed()
+      doAssert subFut2.finished == false
+      doAssert subFut2 != subFut0
 
       await ps.close()
       await base.close()
