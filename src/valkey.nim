@@ -114,13 +114,12 @@ type
     kind*: PubSubEventKind
     pattern*: string
     channel*: string
-    data*: string
+    data*: string # TODO: perhaps add seperate field for integer data (subscribe/unsubscribe/...) and string data (pong/message/...) ?
 
   AsyncPubSub* = ref object
     params*: ValkeyConnParams
     conn*: AsyncValkey             # nil until first subscribe
     ignoreSubscribeMessages*: bool
-
     channels*: HashSet[string]
     patterns*: HashSet[string]
     shardChannels*: HashSet[string]
@@ -129,8 +128,8 @@ type
     pendingUnsubPatterns*: HashSet[string]
     pendingUnsubShardChannels*: HashSet[string]
 
-    subscribed*: bool
-    subscribedFut*: Future[void]
+    subscribed*: bool # at least one active sub
+    subscribedFut*: Future[void] # comples when 0 -> >0, resets when >0 -> 0
 
     pendingPing: int
 
@@ -172,6 +171,12 @@ proc openAsync*(host = "localhost", port = 6379.Port): Future[AsyncRedis] {.asyn
     socket: newAsyncSocket(buffered = true),
     pipeline: newPipeline(),
     sendQueue: initDeque[Future[void]]()
+  )
+  result.params = ValkeyConnParams(
+    host: host,
+    port: port,
+    username: "",
+    password: ""
   )
 
   await result.socket.connect(host, port)
@@ -1323,22 +1328,26 @@ proc waitSubscribed*(ps: AsyncPubSub): Future[void] =
   ps.subscribedFut
 
 proc updateSubscribed*(ps: AsyncPubSub): void =
+  # check for active subscription
   let now = ps.channels.len > 0 or ps.patterns.len > 0 or ps.shardChannels.len > 0
+  # if the current state is the same as the saved state, no change
   if now == ps.subscribed:
     return
-
-  ps.subscribed = now
+  ps.subscribed = now # update state
+  # complete or reset future
   if now:
     if not ps.subscribedFut.finished:
       ps.subscribedFut.complete()
   else:
     ps.subscribedFut = newFuture[void]("pubsub.subscribed")
 
-proc subscribeImpl(ps: AsyncPubSub; channels: seq[string]): Future[void] {.async.}  =
-  let uniqueChannels = channels.deduplicate()
+proc normalizeTargets*(xs: seq[string]; cmdName: string): seq[string] =
+  result = xs.deduplicate()
+  if result.len == 0:
+    raise newException(ValueError, cmdName & " needs at least one target")
 
-  if uniqueChannels.len == 0:
-    raise newException(ValueError, "SUBSCRIBE needs at least one channel")
+proc subscribeImpl(ps: AsyncPubSub; channels: seq[string]): Future[void] {.async.}  =
+  let uniqueChannels = normalizeTargets(channels, "SUBSCRIBE")
 
   var argv = newSeqOfCap[string](1 + uniqueChannels.len)
   argv.add "SUBSCRIBE"
@@ -1354,10 +1363,7 @@ proc subscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
   return ps.subscribeImpl(@channels)
 
 proc psubscribeImpl(ps: AsyncPubSub; patterns: seq[string]): Future[void] {.async.}  =
-  let uniquePatterns = patterns.deduplicate()
-
-  if uniquePatterns.len == 0:
-    raise newException(ValueError, "PSUBSCRIBE needs at least one pattern")
+  let uniquePatterns = normalizeTargets(patterns, "PSUBSCRIBE")
 
   var argv = newSeqOfCap[string](1 + uniquePatterns.len)
   argv.add "PSUBSCRIBE"
@@ -1373,10 +1379,7 @@ proc psubscribe*(ps: AsyncPubSub; pattern: varargs[string]): Future[void] =
   return ps.psubscribeImpl(@pattern)
 
 proc ssubscribeImpl(ps: AsyncPubSub; channels: seq[string]): Future[void] {.async.}  =
-  let uniqueChannels = channels.deduplicate()
-
-  if uniqueChannels.len == 0:
-    raise newException(ValueError, "SSUBSCRIBE needs at least one channel")
+  let uniqueChannels = normalizeTargets(channels, "SSUBSCRIBE")
 
   var argv = newSeqOfCap[string](1 + uniqueChannels.len)
   argv.add "SSUBSCRIBE"
@@ -1391,6 +1394,7 @@ proc ssubscribeImpl(ps: AsyncPubSub; channels: seq[string]): Future[void] {.asyn
 proc ssubscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
   return ps.ssubscribeImpl(@channels)
 
+# TODO: add pendingUnsub tracking and normalize/dedup
 proc unsubscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
   if channels.len == 0:
     return ps.executeCommand("UNSUBSCRIBE")
@@ -1476,7 +1480,7 @@ proc parseEvent*(response: openArray[string]): Option[PubSubEvent] =
     return some(event)
 
   else:
-    return none(PubSubEvent)
+    return none(PubSubEvent) # TODO: figure out what to do with "unknown" events. Maybe return an event with kind pekUnknown with channel/data...
 
 proc subKey(ev : PubSubEvent): string =
   if ev.pattern.len > 0: ev.pattern else: ev.channel
@@ -1520,7 +1524,7 @@ proc applyState(ps: AsyncPubSub; ev: PubSubEvent): void =
     # no state change for other event kinds
     discard
 
-proc handleMessage*(ps: AsyncPubSub; frame: RedisList): Option[PubSubEvent] =
+proc handleMessage*(ps: AsyncPubSub; frame: RedisList; ignoreSubscribeMessages=false): Option[PubSubEvent] =
   if frame.len == 0: return none(PubSubEvent)
 
   let eventOpt = parseEvent(frame)
@@ -1550,18 +1554,21 @@ proc handleMessage*(ps: AsyncPubSub; frame: RedisList): Option[PubSubEvent] =
   if isSubCtl:
     ps.applyState(event)
 
-  if isSubCtl and ps.ignoreSubscribeMessages:
+  if isSubCtl and (ignoreSubscribeMessages or ps.ignoreSubscribeMessages):
     return none(PubSubEvent)
   return some(event)
 
-proc receiveEvent*(ps: AsyncPubSub): Future[PubSubEvent] {.async.} =
+proc receiveEvent*(ps: AsyncPubSub; ignoreSubscribeMessages=false): Future[PubSubEvent] {.async.} =
+  # raise error if connection is None
+  if ps.conn.isNil:
+    raise newException(ValueError, "pubsub connection not set: did you forget to call subscribe() or psubscribe()?")
   while true:
     let frame = await ps.parseResponse()
-    let eventOpt = ps.handleMessage(frame)
+    let eventOpt = ps.handleMessage(frame, ignoreSubscribeMessages)
     if eventOpt.isSome:
       return eventOpt.get()
 
-proc receiveMessage*(ps: AsyncPubSub): Future[PubSubEvent] {.async.} =
+proc receiveMessage*(ps: AsyncPubSub; ignoreSubscribeMessages=false): Future[PubSubEvent] {.async.} =
   while true:
     let event = await ps.receiveEvent()
     if event.kind in {pekMessage, pekPMessage, pekSMessage}:

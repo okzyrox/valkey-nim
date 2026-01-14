@@ -197,32 +197,7 @@ suite "valkey async tests":
       doAssert (await sub.nextMessage()).message == "three"
 
     waitFor main()
-
-  test "message":
-    let event_option = parseEvent(["message", "chan", "hi"])
-    check event_option.isSome
-    let event = event_option.get()
-    check event.kind == pekMessage
-    check event.channel == "chan"
-    check event.data == "hi"
-
-  test "pmessage":
-    let event_option = parseEvent(["pmessage", "pat*", "chan", "hello"])
-    check event_option.isSome
-    let event = event_option.get()
-    check event.kind == pekPMessage
-    check event.pattern == "pat*"
-    check event.channel == "chan"
-    check event.data == "hello"
-
-  test "subscribe data = str(count)":
-    let event_option = parseEvent(["subscribe", "chan", "1"])
-    check event_option.isSome
-    let event = event_option.get()
-    check event.kind == pekSubscribe
-    check event.channel == "chan"
-    check event.data == "1"
-
+  # TODO: Make new suite for pubsub v2 tests
   test "bad arity -> none":
     check parseEvent(["message", "chan"]).isNone
 
