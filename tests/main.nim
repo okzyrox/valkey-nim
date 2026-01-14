@@ -256,8 +256,15 @@ suite "valkey async tests":
       # subscribe to ch2 and don't consume its ack
       await ps.subscribe(ch2)
 
-      # publish to ch1
-      discard await pub.publish(ch1, "hello")
+      # publish to ch1, but retry until at least one listener is found
+      # TODO: add subscribeWaitAcks helper to pubsub?
+      var listeners = 0
+      for _ in 0..< 100:
+        listeners = await pub.publish(ch1, "hello")
+        if listeners >= 1:
+          break
+        await sleepAsync(50)
+      doAssert listeners >= 1
 
       # should get the message from ch1 not the acks from ch1 or ch2
       let fut = ps.receiveEvent()
