@@ -1417,7 +1417,8 @@ proc sunsubscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
   return ps.executeCommand(argv)
 
 proc parseResponse*(ps: AsyncPubSub): Future[RedisList] {.async.} =
-  await ps.ensureConn()
+  if ps.conn.isNil:
+    raise newException(ValueError, "pubsub connection not set: did you forget to call a pubsub command (subscribe()/psubscribe()/ping())?") # TODO: better exception type here (eg PubSubError)
   return await ps.conn.readPubSubFrame()
 
 proc stringToKind(s: string): PubSubEventKind =
