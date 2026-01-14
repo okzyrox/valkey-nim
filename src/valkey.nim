@@ -1322,6 +1322,7 @@ proc executeCommand*(ps: AsyncPubSub; cmd:string; args: varargs[string]): Future
   for a in args: argv.add a
   return ps.executeCommandImpl(argv)
 
+# TODO: consider adding 'subscribeWaitAcks' that waits for server acks
 proc waitSubscribed*(ps: AsyncPubSub): Future[void] =
   ## Completes once the pubsub instance has at least one active subscription
   ## Resets with new future when subscriptions drop back to zero.
@@ -1571,7 +1572,7 @@ proc receiveEvent*(ps: AsyncPubSub; ignoreSubscribeMessages=false): Future[PubSu
 
 proc receiveMessage*(ps: AsyncPubSub; ignoreSubscribeMessages=false): Future[PubSubEvent] {.async.} =
   while true:
-    let event = await ps.receiveEvent()
+    let event = await ps.receiveEvent(ignoreSubscribeMessages=ignoreSubscribeMessages)
     if event.kind in {pekMessage, pekPMessage, pekSMessage}:
       return event
 
