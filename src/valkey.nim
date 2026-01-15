@@ -1343,7 +1343,7 @@ proc updateSubscribed*(ps: AsyncPubSub): void =
   else:
     ps.subscribedFut = newFuture[void]("pubsub.subscribed")
 
-proc normalizeTargets*(xs: seq[string]; cmdName: string): seq[string] =
+proc normalizeTargets(xs: seq[string]; cmdName: string): seq[string] =
   result = xs.deduplicate()
   if result.len == 0:
     raise newException(ValueError, cmdName & " needs at least one target")
