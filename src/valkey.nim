@@ -445,6 +445,7 @@ proc readNext(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   r.pipeline.expected -= 1
   return res
 
+# TODO: RESP2 only for now - RESP3 push support later
 proc readPubSubFrame*(r: Redis | AsyncRedis): Future[RedisList] {.multisync, gcsafe.} =
   ## Reads exactly one RESP frame from the socket (subscribe acks, messages, pong, etc.)
   ## Does not touch pipeline.expected.
@@ -1312,11 +1313,11 @@ proc executeCommandImpl(ps: AsyncPubSub; argv: seq[string]): Future[void] {.asyn
   # IMPORTANT: bypass managedSend/SendCommand to avoid currentCommand/finalise coupling.
   await ps.conn.socket.send(req) # send-only, no reads, no managedSend
 
-proc executeCommand*(ps: AsyncPubSub; argv: openArray[string]): Future[void] =
+proc executeCommand(ps: AsyncPubSub; argv: openArray[string]): Future[void] =
   # Execute with argv as is
   return ps.executeCommandImpl(@argv)
 
-proc executeCommand*(ps: AsyncPubSub; cmd:string; args: varargs[string]): Future[void] =
+proc executeCommand(ps: AsyncPubSub; cmd:string; args: varargs[string]): Future[void] =
   # Construct argv from cmd + args
   var argv: seq[string] = @[cmd]
   for a in args: argv.add a
@@ -1677,12 +1678,30 @@ proc ping*(ps: AsyncPubSub; payload = ""): Future[void] {.async.} =
   else:
     await ps.executeCommand("PING", payload)
 
+proc resetState(ps: AsyncPubSub): void =
+  ## Reset the Pub/Sub instance state
+  ps.channels.clear()
+  ps.patterns.clear()
+  ps.shardChannels.clear()
+
+  ps.pendingUnsubChannels.clear()
+  ps.pendingUnsubPatterns.clear()
+  ps.pendingUnsubShardChannels.clear()
+
+  ps.subscribed = false
+
+  if not ps.subscribedFut.finished:
+    ps.subscribedFut.complete()
+
+  ps.subscribedFut = newFuture[void]("pubsub.subscribed")
+  ps.pendingPing = 0
+
 proc close*(ps: AsyncPubSub): Future[void] {.async.} =
   ## Pub/Sub connection close (disconnect)
-  if ps.conn.isNil:
-    return
-  ps.conn.socket.close()
-  ps.conn = nil
+  if not ps.conn.isNil:
+    ps.conn.socket.close()
+    ps.conn = nil
+  ps.resetState()
 
 proc close*(r: Redis | AsyncRedis): Future[void] {.multisync.} =
   ## Close the connection
@@ -1697,6 +1716,7 @@ proc quit*(ps: AsyncPubSub): Future[void] {.async.} =
     discard
   ps.conn.socket.close()
   ps.conn = nil
+  ps.resetState()
 
 proc quit*(r: Redis | AsyncRedis): Future[void] {.multisync.} =
   ## Close the connection with using QUIT command
