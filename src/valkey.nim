@@ -1317,7 +1317,7 @@ proc executeCommand(ps: AsyncPubSub; argv: openArray[string]): Future[void] =
   # Execute with argv as is
   return ps.executeCommandImpl(@argv)
 
-proc executeCommand(ps: AsyncPubSub; cmd:string; args: varargs[string]): Future[void] =
+proc executeCommand(ps: AsyncPubSub; cmd: string; args: varargs[string]): Future[void] =
   # Construct argv from cmd + args
   var argv: seq[string] = @[cmd]
   for a in args: argv.add a
