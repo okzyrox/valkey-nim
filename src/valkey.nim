@@ -35,7 +35,7 @@
 ##
 ##    waitFor main()
 
-import std/net, asyncdispatch, asyncnet, os, strutils, parseutils, deques, options
+import std/net, asyncdispatch, asyncnet, os, strutils, parseutils, deques, options, sets, sequtils
 
 const
   valkeyNil* = "\0\0"
@@ -55,10 +55,18 @@ type
   Valkey* = ref object of ValkeyBase[net.Socket]
     ## A synchronous valkey client.
 
+  ValkeyConnParams* = object
+    host*: string
+    port*: Port
+    username*: string
+    password*: string
+    # TODO: include db / tls/ timeouts once reconnect is implemented
+
   AsyncValkey* = ref object of ValkeyBase[asyncnet.AsyncSocket]
     ## An asynchronous valkey client.
     currentCommand: Option[string]
     sendQueue: Deque[Future[void]]
+    params: ValkeyConnParams
 
   ValkeyStatus* = string
   ValkeyInteger* = BiggestInt
@@ -92,6 +100,38 @@ type
   RedisMessage* = ValkeyMessage
   RedisError* = ValkeyError
   RedisCursor* = ValkeyCursor
+
+  ## --- Pub/Sub ---
+  PubSubEventKind* = enum
+    pekUnknown,
+    pekSubscribe, pekUnsubscribe,
+    pekPSubscribe, pekPUnsubscribe,
+    pekSSubscribe, pekSUnsubscribe,
+    pekMessage, pekPMessage, pekSMessage,
+    pekPong
+
+  PubSubEvent* = object
+    kind*: PubSubEventKind
+    pattern*: string
+    channel*: string
+    data*: string # TODO: perhaps add separate field for integer data (subscribe/unsubscribe/...) and string data (pong/message/...) ?
+
+  AsyncPubSub* = ref object
+    params*: ValkeyConnParams
+    conn*: AsyncValkey             # nil until first subscribe
+    ignoreSubscribeMessages*: bool
+    channels*: HashSet[string]
+    patterns*: HashSet[string]
+    shardChannels*: HashSet[string]
+
+    pendingUnsubChannels*: HashSet[string]
+    pendingUnsubPatterns*: HashSet[string]
+    pendingUnsubShardChannels*: HashSet[string]
+
+    subscribed*: bool # at least one active sub
+    subscribedFut*: Future[void] # completes when 0 -> >0, resets when >0 -> 0
+
+    pendingPing: int
 
 proc newPipeline(): Pipeline =
   new(result)
@@ -131,6 +171,12 @@ proc openAsync*(host = "localhost", port = 6379.Port): Future[AsyncRedis] {.asyn
     socket: newAsyncSocket(buffered = true),
     pipeline: newPipeline(),
     sendQueue: initDeque[Future[void]]()
+  )
+  result.params = ValkeyConnParams(
+    host: host,
+    port: port,
+    username: "",
+    password: ""
   )
 
   await result.socket.connect(host, port)
@@ -284,7 +330,7 @@ proc readSingleString(
     return
 
   var s = await r.managedRecv(numBytes + 2)
-  result = some(strip(s))
+  result = some(s[0 ..< numBytes]) # Strip \r\n
 
 proc readSingleString(r: Redis | AsyncRedis): Future[RedisString] {.multisync.} =
   # TODO: Rename these style of procedures to `processSingleString`?
@@ -310,13 +356,47 @@ proc readArrayLines(r: Redis | AsyncRedis, countLine: string): Future[RedisList]
 
   for i in 1..numElems:
     when r is Redis:
-      var parsed = r.readNext()
+      let parsed = r.readNext()
     else:
-      var parsed = await r.readNext()
+      let parsed = await r.readNext()
 
     if parsed.len > 0:
       for item in parsed:
         result.add(item)
+
+
+proc readPubSubElement(r: Redis | AsyncRedis; firstLine: string): Future[string] {.multisync, gcsafe.} =
+  if firstLine.len == 0:
+    raiseReplyError(r, "pubsub connection closed")
+  case firstLine[0]
+  of '+':
+    # status: +PONG / +OK / etc
+    return firstLine.substr(1)
+  of '-':
+    raiseRedisError(r, strip(firstLine))
+  of ':':
+    return $(r.parseInteger(firstLine))
+  of '$':
+    let x = await r.readSingleString(firstLine, true)
+    return x.get(redisNil)
+  of '*':
+    # nested array: flatten with a delimiter or raise; Pub/Sub shouldn't have nested arrays
+    raiseReplyError(r, "Unexpected nested array in Pub/Sub element")
+  else:
+    raiseReplyError(r, "readPubSubElement failed on line: " & firstLine)
+
+proc readPubSubArrayLines(r: Redis | AsyncRedis; countLine: string):Future[RedisList] {.multisync, gcsafe.} =
+  if countLine.len == 0 or countLine[0] != '*':
+    raiseInvalidReply(r, '*', (if countLine.len == 0: '\0' else: countLine[0]))
+  let n = parseInt(countLine.substr(1))
+  result = @[]
+  if n == -1:
+    return
+  for _ in 0..<n:
+    let line = await r.managedRecvLine()
+    if line.len == 0:
+      raiseReplyError(r, "pubsub connection closed")
+    result.add(await r.readPubSubElement(line))
 
 proc readArrayLines(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   let line = await r.managedRecvLine()
@@ -364,6 +444,35 @@ proc readNext(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
 
   r.pipeline.expected -= 1
   return res
+
+# TODO: RESP2 only for now - RESP3 push support later
+proc readPubSubFrame*(r: Redis | AsyncRedis): Future[RedisList] {.multisync, gcsafe.} =
+  ## Reads exactly one RESP frame from the socket (subscribe acks, messages, pong, etc.)
+  ## Does not touch pipeline.expected.
+  ##
+  ## In Pub/Sub mode, the frames are push messages and are not 1:1 with commands,
+  ## so pipeline book keeping would be incorrect here.
+  let line = await r.managedRecvLine()
+
+  ## In pubsub, returning @[] is ambiguous and empty lines should trigger disconnect/EOF.
+  if line.len == 0:
+    raiseReplyError(r, "pubsub connection closed")
+
+
+  case line[0]
+  of '*':
+    return await r.readPubSubArrayLines(line)
+  of '+':
+    return @[line.substr(1)]
+  of '-':
+    raiseRedisError(r, strip(line))
+  of ':':
+    return @[$(r.parseInteger(line))]
+  of '$':
+    let x = await r.readSingleString(line, true)
+    return @[x.get(redisNil)]
+  else:
+    raiseReplyError(r, "readPubSubFrame failed on line: " & line)
 
 proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] {.multisync.} =
   ## Send buffered commands, clear buffer, return results
@@ -1156,6 +1265,318 @@ proc pfmerge*(r: Redis | AsyncRedis, destination: string, sources: seq[string]):
 
 # Pub/Sub
 
+proc pubsub*(c: AsyncValkey; ignoreSubscribeMessages=false): AsyncPubSub =
+  new(result)
+  result.params = c.params
+  result.conn = nil # lazy
+  result.ignoreSubscribeMessages = ignoreSubscribeMessages
+
+  result.channels = initHashSet[string]()
+  result.patterns = initHashSet[string]()
+  result.shardChannels = initHashSet[string]()
+
+  result.pendingUnsubChannels = initHashSet[string]()
+  result.pendingUnsubPatterns = initHashSet[string]()
+  result.pendingUnsubShardChannels = initHashSet[string]()
+
+  result.subscribed = false
+  result.subscribedFut = newFuture[void]("pubsub.subscribed")
+
+proc connectValkeyAsync*(host = "localhost", port = 6379.Port, db = 0,
+                        username = "", password = ""): Future[AsyncValkey]
+
+proc ensureConn(ps: AsyncPubSub): Future[void] {.async.} =
+  ## Lazily create a AsyncValkey connection for the Pub/Sub instance
+  if ps.conn.isNil:
+    # NOTE: db not in params yet; use default 0
+    ps.conn = await connectValkeyAsync(
+      host = ps.params.host,
+      port = ps.params.port,
+      username = ps.params.username,
+      password = ps.params.password
+    )
+    ps.conn.pipeline.enabled = false
+    ps.conn.pipeline.expected = 0
+
+proc encodeRespArray(argv: openArray[string]): string =
+  ## Encode argv as RESP2 Array of bulk strings
+  ## e.g. ["PING", "hello"] -> "*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n"
+  doAssert argv.len > 0
+  result = "*" & $argv.len & "\c\L"
+  for arg in argv:
+    result.add("$" & $arg.len & "\c\L")
+    result.add(arg & "\c\L")
+
+proc executeCommandImpl(ps: AsyncPubSub; argv: seq[string]): Future[void] {.async.} =
+  let req = encodeRespArray(argv)
+  await ps.ensureConn()
+  # IMPORTANT: bypass managedSend/SendCommand to avoid currentCommand/finalise coupling.
+  await ps.conn.socket.send(req) # send-only, no reads, no managedSend
+
+proc executeCommand(ps: AsyncPubSub; argv: openArray[string]): Future[void] =
+  # Execute with argv as is
+  return ps.executeCommandImpl(@argv)
+
+proc executeCommand(ps: AsyncPubSub; cmd: string; args: varargs[string]): Future[void] =
+  # Construct argv from cmd + args
+  var argv: seq[string] = @[cmd]
+  for a in args: argv.add a
+  return ps.executeCommandImpl(argv)
+
+# TODO: consider adding 'subscribeWaitAcks' that waits for server acks
+proc waitSubscribed*(ps: AsyncPubSub): Future[void] =
+  ## Completes once the pubsub instance has at least one active subscription
+  ## Resets with new future when subscriptions drop back to zero.
+  ps.subscribedFut
+
+proc updateSubscribed(ps: AsyncPubSub): void =
+  # check for active subscription
+  let now = ps.channels.len > 0 or ps.patterns.len > 0 or ps.shardChannels.len > 0
+  # if the current state is the same as the saved state, no change
+  if now == ps.subscribed:
+    return
+  ps.subscribed = now # update state
+  # complete or reset future
+  if now:
+    if not ps.subscribedFut.finished:
+      ps.subscribedFut.complete()
+  else:
+    ps.subscribedFut = newFuture[void]("pubsub.subscribed")
+
+proc normalizeTargets(xs: seq[string]; cmdName: string): seq[string] =
+  result = xs.deduplicate()
+  if result.len == 0:
+    raise newException(ValueError, cmdName & " needs at least one target")
+
+proc subscribeImpl(ps: AsyncPubSub; channels: seq[string]): Future[void] {.async.}  =
+  let uniqueChannels = normalizeTargets(channels, "SUBSCRIBE")
+
+  var argv = newSeqOfCap[string](1 + uniqueChannels.len)
+  argv.add "SUBSCRIBE"
+  for c in uniqueChannels: argv.add c
+
+  await ps.executeCommand(argv)
+
+  for c in uniqueChannels:
+    ps.channels.incl(c)
+    ps.pendingUnsubChannels.excl(c)
+
+proc subscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
+  return ps.subscribeImpl(@channels)
+
+proc psubscribeImpl(ps: AsyncPubSub; patterns: seq[string]): Future[void] {.async.}  =
+  let uniquePatterns = normalizeTargets(patterns, "PSUBSCRIBE")
+
+  var argv = newSeqOfCap[string](1 + uniquePatterns.len)
+  argv.add "PSUBSCRIBE"
+  for p in uniquePatterns: argv.add p
+
+  await ps.executeCommand(argv)
+
+  for p in uniquePatterns:
+    ps.patterns.incl(p)
+    ps.pendingUnsubPatterns.excl(p)
+
+proc psubscribe*(ps: AsyncPubSub; pattern: varargs[string]): Future[void] =
+  return ps.psubscribeImpl(@pattern)
+
+proc ssubscribeImpl(ps: AsyncPubSub; channels: seq[string]): Future[void] {.async.}  =
+  let uniqueChannels = normalizeTargets(channels, "SSUBSCRIBE")
+
+  var argv = newSeqOfCap[string](1 + uniqueChannels.len)
+  argv.add "SSUBSCRIBE"
+  for c in uniqueChannels: argv.add c
+
+  await ps.executeCommand(argv)
+
+  for c in uniqueChannels:
+    ps.shardChannels.incl(c)
+    ps.pendingUnsubShardChannels.excl(c)
+
+proc ssubscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
+  return ps.ssubscribeImpl(@channels)
+
+# TODO: add pendingUnsub tracking and normalize/dedup
+proc unsubscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
+  if channels.len == 0:
+    return ps.executeCommand("UNSUBSCRIBE")
+  var argv: seq[string] = @["UNSUBSCRIBE"]
+  for c in channels: argv.add c
+  return ps.executeCommand(argv)
+
+proc punsubscribe*(ps: AsyncPubSub; patterns: varargs[string]): Future[void] =
+  if patterns.len == 0:
+    return ps.executeCommand("PUNSUBSCRIBE")
+  var argv: seq[string] = @["PUNSUBSCRIBE"]
+  for p in patterns: argv.add p
+  return ps.executeCommand(argv)
+
+proc sunsubscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
+  if channels.len == 0:
+    return ps.executeCommand("SUNSUBSCRIBE")
+  var argv: seq[string] = @["SUNSUBSCRIBE"]
+  for c in channels: argv.add c
+  return ps.executeCommand(argv)
+
+proc parseResponse*(ps: AsyncPubSub): Future[RedisList] {.async.} =
+  if ps.conn.isNil:
+    raise newException(ValueError, "pubsub connection not set: did you forget to call a pubsub command (subscribe()/psubscribe()/ping())?") # TODO: better exception type here (eg PubSubError)
+  return await ps.conn.readPubSubFrame()
+
+proc stringToKind(s: string): PubSubEventKind =
+  case s.toLowerAscii()
+  of "subscribe":    pekSubscribe
+  of "unsubscribe":  pekUnsubscribe
+  of "psubscribe":   pekPSubscribe
+  of "punsubscribe": pekPUnsubscribe
+  of "ssubscribe":   pekSSubscribe
+  of "sunsubscribe": pekSUnsubscribe
+  of "message":      pekMessage
+  of "pmessage":     pekPMessage
+  of "smessage":     pekSMessage
+  of "pong":         pekPong
+  else:              pekUnknown
+
+proc parseEvent*(response: openArray[string]): Option[PubSubEvent] =
+  if response.len == 0: return none(PubSubEvent)
+
+  let kind = stringToKind(response[0])
+  var event = PubSubEvent(kind: kind)
+
+  case kind
+  of pekPMessage:
+    # ["pmessage", pattern, channel, data]
+    if response.len != 4: return none(PubSubEvent)
+    event.pattern = response[1]
+    event.channel = response[2]
+    event.data = response[3]
+    return some(event)
+
+  of pekMessage, pekSMessage:
+    # ["message"|"smessage", channel, data]
+    if response.len != 3: return none(PubSubEvent)
+    event.channel = response[1]
+    event.data = response[2]
+    return some(event)
+
+  of pekPong:
+    # ["pong"] / ["PONG"] or ["pong", data]
+    if response.len == 1:
+      event.data = ""
+      return some(event)
+    if response.len != 2: return none(PubSubEvent)
+    event.data = response[1]
+    return some(event)
+
+  of pekPSubscribe, pekPUnsubscribe:
+    # ["psubscribe"|"punsubscribe", pattern, count]
+    if response.len != 3: return none(PubSubEvent)
+    event.pattern = response[1]
+    event.data = response[2]
+    return some(event)
+
+  of pekSubscribe, pekUnsubscribe, pekSSubscribe, pekSUnsubscribe:
+    # ["subscribe"|"unsubscribe"|"ssubscribe"|"sunsubscribe", channel, count]
+    if response.len != 3: return none(PubSubEvent)
+    event.channel = response[1]
+    event.data = response[2]
+    return some(event)
+
+  else:
+  return none(PubSubEvent) # TODO: figure out what to do with "unknown" events. Maybe return an event with kind pekUnknown with channel/data...
+
+  proc subKey(ev: PubSubEvent): string =
+  if ev.pattern.len > 0: ev.pattern else: ev.channel
+
+  proc applyState(ps: AsyncPubSub; ev: PubSubEvent): void =
+  let key = subKey(ev)
+  if key.len == 0: return
+
+  case ev.kind
+  of pekSubscribe:
+    ps.channels.incl(key)
+    ps.pendingUnsubChannels.excl(key)
+    ps.updateSubscribed()
+
+  of pekUnsubscribe:
+    ps.channels.excl(key)
+    ps.pendingUnsubChannels.excl(key)
+    ps.updateSubscribed()
+
+  of pekPSubscribe:
+    ps.patterns.incl(key)
+    ps.pendingUnsubPatterns.excl(key)
+    ps.updateSubscribed()
+
+  of pekPUnsubscribe:
+    ps.patterns.excl(key)
+    ps.pendingUnsubPatterns.excl(key)
+    ps.updateSubscribed()
+
+  of pekSSubscribe:
+    ps.shardChannels.incl(key)
+    ps.pendingUnsubShardChannels.excl(key)
+    ps.updateSubscribed()
+
+  of pekSUnsubscribe:
+    ps.shardChannels.excl(key)
+    ps.pendingUnsubShardChannels.excl(key)
+    ps.updateSubscribed()
+
+  else:
+    # no state change for other event kinds
+    discard
+
+proc handleMessage*(ps: AsyncPubSub; frame: RedisList; ignoreSubscribeMessages=false): Option[PubSubEvent] =
+  if frame.len == 0: return none(PubSubEvent)
+
+  let eventOpt = parseEvent(frame)
+
+  # Scalar replies (non-subscribed PING) arrive as @["..."]
+  if eventOpt.isNone:
+    if not ps.subscribed and ps.pendingPing > 0 and frame.len == 1:
+      dec ps.pendingPing
+      let s = frame[0]
+      if s.cmpIgnoreCase("PONG") == 0:
+        return some(PubSubEvent(kind: pekPong, data: ""))
+      else:
+        return some(PubSubEvent(kind: pekPong, data: s))
+    return none(PubSubEvent)
+
+  let event = eventOpt.get()
+
+  # Pubsub mode : ["pong"] or ["pong", data]
+  if event.kind == pekPong and ps.pendingPing > 0:
+    dec ps.pendingPing
+
+  let isSubCtl = event.kind in {
+     pekSubscribe, pekUnsubscribe,
+     pekPSubscribe, pekPUnsubscribe,
+     pekSSubscribe, pekSUnsubscribe
+  }
+  if isSubCtl:
+    ps.applyState(event)
+
+  if isSubCtl and (ignoreSubscribeMessages or ps.ignoreSubscribeMessages):
+    return none(PubSubEvent)
+  return some(event)
+
+proc receiveEvent*(ps: AsyncPubSub; ignoreSubscribeMessages=false): Future[PubSubEvent] {.async.} =
+  # raise error if connection is None
+  if ps.conn.isNil:
+    raise newException(ValueError, "pubsub connection not set: did you forget to call subscribe(), psubscribe(), or ping()?")
+  while true:
+    let frame = await ps.parseResponse()
+    let eventOpt = ps.handleMessage(frame, ignoreSubscribeMessages)
+    if eventOpt.isSome:
+      return eventOpt.get()
+
+proc receiveMessage*(ps: AsyncPubSub; ignoreSubscribeMessages=false): Future[PubSubEvent] {.async.} =
+  while true:
+    let event = await ps.receiveEvent(ignoreSubscribeMessages=ignoreSubscribeMessages)
+    if event.kind in {pekMessage, pekPMessage, pekSMessage}:
+      return event
+
 # proc psubscribe*(r: Redis, pattern: openarray[string]): ???? =
 #   ## Listen for messages published to channels matching the given patterns
 #   r.socket.send("PSUBSCRIBE $#\c\L" % pattern)
@@ -1249,9 +1670,53 @@ proc ping*(r: Redis | AsyncRedis): Future[RedisStatus] {.multisync.} =
   await r.sendCommand("PING")
   result = await r.readStatus()
 
+proc ping*(ps: AsyncPubSub; payload = ""): Future[void] {.async.} =
+  await ps.ensureConn()
+  inc ps.pendingPing
+  if payload.len == 0:
+    await ps.executeCommand("PING")
+  else:
+    await ps.executeCommand("PING", payload)
+
+proc resetState(ps: AsyncPubSub): void =
+  ## Reset the Pub/Sub instance state
+  ps.channels.clear()
+  ps.patterns.clear()
+  ps.shardChannels.clear()
+
+  ps.pendingUnsubChannels.clear()
+  ps.pendingUnsubPatterns.clear()
+  ps.pendingUnsubShardChannels.clear()
+
+  ps.subscribed = false
+
+  if not ps.subscribedFut.finished:
+    ps.subscribedFut.complete()
+
+  ps.subscribedFut = newFuture[void]("pubsub.subscribed")
+  ps.pendingPing = 0
+
+proc close*(ps: AsyncPubSub): Future[void] {.async.} =
+  ## Pub/Sub connection close (disconnect)
+  if not ps.conn.isNil:
+    ps.conn.socket.close()
+    ps.conn = nil
+  ps.resetState()
+
 proc close*(r: Redis | AsyncRedis): Future[void] {.multisync.} =
   ## Close the connection
   r.socket.close()
+
+proc quit*(ps: AsyncPubSub): Future[void] {.async.} =
+  ## Close the Pub/Sub connection with using QUIT command
+  if ps.conn.isNil: return
+  try:
+    await ps.executeCommand("QUIT")
+  except:
+    discard
+  ps.conn.socket.close()
+  ps.conn = nil
+  ps.resetState()
 
 proc quit*(r: Redis | AsyncRedis): Future[void] {.multisync.} =
   ## Close the connection with using QUIT command
@@ -1289,6 +1754,7 @@ proc connectValkeyUnix*(path = "/var/run/valkey/valkey-server.sock", db = 0, use
 proc connectValkeyAsync*(host = "localhost", port = 6379.Port, db = 0, username = "", password = ""): Future[AsyncValkey] {.async.} =
   ## Open an asynchronous connection to a valkey server.
   let v = await openAsync(host, port)
+  v.params = ValkeyConnParams(host: host, port: port, username: username, password: password)
   await v.setupValkeyConnection(db, username, password)
   result = v
 

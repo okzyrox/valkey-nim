@@ -1,4 +1,4 @@
-import valkey, unittest, asyncdispatch, os, strutils
+import valkey, unittest, asyncdispatch, os, strutils, options
 
 proc getValkeyPassword(): string =
   let path = getHomeDir() / "valkey.creds"
@@ -176,7 +176,7 @@ suite "valkey async tests":
 
     check waitFor main()
 
-  test "pub/sub":
+  test "pub/sub legacy":
 
     proc main() {.async.} =
       let sub = await connectTest(AsyncValkey)
@@ -197,6 +197,229 @@ suite "valkey async tests":
       doAssert (await sub.nextMessage()).message == "three"
 
     waitFor main()
+  # TODO: Make new suite for pubsub v2 tests
+  test "bad arity -> none":
+    check parseEvent(["message", "chan"]).isNone
+
+  test "lazy pubsub":
+    let r = waitFor connectTest(AsyncValkey)
+    let ps = r.pubsub(ignoreSubscribeMessages = true)
+    check ps.conn.isNil
+    check ps.ignoreSubscribeMessages == true
+    check ps.params.host == "localhost"
+    check int(ps.params.port) == 6379
+
+  test "check subscribe acks with pubsub lazy connection":
+    proc main(): Future[bool] {.async.} =
+      let base = await connectTest(AsyncValkey)
+      let ps = base.pubsub(ignoreSubscribeMessages = false)
+      doAssert ps.conn.isNil
+
+      let ch = "test_pubsub_sub_ack"
+
+      # duplicates should be deduped to one subscribe ack
+      await ps.subscribe(ch, ch, ch)
+      doAssert ps.conn.isNil == false
+
+      # until ack is consumed, subscribe should be false
+      doAssert ps.subscribed == false
+
+      let frame = await ps.parseResponse()
+
+      doAssert frame.len == 3
+      doAssert frame[0] == "subscribe"
+      doAssert frame[1] == ch
+      doAssert frame[2] == "1"
+
+      let ev = ps.handleMessage(frame)
+      doAssert ev.isSome
+      doAssert ps.subscribed == true
+
+      await ps.close()
+      await base.close()
+      return true
+    check waitFor main()
+
+  # TODO: This test can be flaky because publish may happen before subscribe is active
+  test "pubsub ignoreSubscribeMessages":
+    proc main(): Future[bool] {.async.} =
+      let base = await connectTest(AsyncValkey)
+      let pub = await connectTest(AsyncValkey)
+      let ps = base.pubsub(ignoreSubscribeMessages = true)
+
+      let ch1 = "test_pubsub_ignore_1"
+      let ch2 = "test_pubsub_ignore_2"
+
+      # subscribe to ch1 and don't consume its ack
+      await ps.subscribe(ch1)
+
+      # subscribe to ch2 and don't consume its ack
+      await ps.subscribe(ch2)
+
+      # publish to ch1, but retry until at least one listener is found
+      # TODO: add subscribeWaitAcks helper to pubsub?
+      var listeners = 0
+      for _ in 0..< 100:
+        listeners = await pub.publish(ch1, "hello")
+        if listeners >= 1:
+          break
+        await sleepAsync(50)
+      doAssert listeners >= 1
+
+      # should get the message from ch1 not the acks from ch1 or ch2
+      let fut = ps.receiveEvent()
+      doAssert await withTimeout(fut, 2000)
+      let event = await fut
+
+      doAssert event.kind == pekMessage
+      doAssert event.channel == ch1
+      doAssert event.data == "hello"
+
+      await ps.close()
+      await pub.close()
+      await base.close()
+      return true
+
+    check waitFor main()
+
+  test "pubsub receiveMessage":
+    proc main(): Future[bool] {.async.} =
+      let base = await connectTest(AsyncValkey)
+      let pub  = await connectTest(AsyncValkey)
+      let ps   = base.pubsub(ignoreSubscribeMessages = false)
+
+      let ch1 = "test_pubsub_receive_1"
+      let ch2 = "test_pubsub_receive_2"
+
+      try:
+        await ps.subscribe(ch1)
+        discard await ps.receiveEvent()  # consume subscribe ack for ch1
+
+        await ps.subscribe(ch2)          # leave ch2 ack pending
+        let msgFut = ps.receiveMessage() # should skip ch2 ack internally
+
+        discard await pub.publish(ch1, "payload")
+
+        doAssert await withTimeout(msgFut, 2000)
+        let event = await msgFut
+
+        doAssert event.kind == pekMessage
+        doAssert event.channel == ch1
+        doAssert event.data == "payload"
+        return true
+      finally:
+        discard await withTimeout(ps.close(), 500)
+        discard await withTimeout(pub.close(), 500)
+        discard await withTimeout(base.close(), 500)
+
+    check waitFor main()
+
+  test "pubsub: PING returns PONG":
+    proc main(): Future[bool] {.async.} =
+      let base = await connectTest(AsyncValkey)
+      let ps = base.pubsub(ignoreSubscribeMessages = false)
+
+      # unsubscribed scalar ping
+      await ps.ping()
+
+      var fut = ps.receiveEvent()
+      doAssert await withTimeout(fut, 2000)
+      let ev = await fut
+
+      doAssert ev.kind == pekPong
+      doAssert ev.data == ""
+      doAssert ev.channel == ""
+
+      # unsubscribed ping with payload
+      let payload = "hello"
+      await ps.ping(payload)
+
+      var futp =  ps.receiveEvent()
+      doAssert await withTimeout(futp, 2000)
+      let evp = await futp
+
+      doAssert evp.kind == pekPong
+      doAssert evp.data == payload
+      doAssert evp.channel == ""
+
+      # subscribed ping
+      let ch = "test_pubsub_ping"
+      await ps.subscribe(ch)
+
+      fut = ps.receiveEvent()
+      doAssert await withTimeout(fut, 2000)
+      discard await fut  # consume subscribe ack
+
+      await ps.ping()
+
+      fut  = ps.receiveEvent()
+      doAssert await withTimeout(fut, 2000)
+      let ev2 = await fut
+      doAssert ev2.kind == pekPong
+      doAssert ev2.data == ""
+      doAssert ev2.channel == ""
+
+      await ps.close()
+      await base.close()
+      return true
+
+    check waitFor main()
+
+  test "unsubscribe":
+    proc main(): Future[bool] {.async.} =
+      let base = await connectTest(AsyncValkey)
+      let ps = base.pubsub(ignoreSubscribeMessages = false)
+
+      let ch1 = "test_unsub_1"
+      let ch2 = "test_unsub_2"
+
+      # waitSubscribed shouldn't be finished yet
+      let subFut0 = ps.waitSubscribed()
+      doAssert subFut0.finished == false
+      doAssert ps.subscribed == false
+
+      await ps.subscribe(ch1, ch2)
+
+      # consume ack 1
+      discard await ps.receiveEvent()
+      doAssert ps.subscribed == true
+      doAssert subFut0.finished == true
+
+      # consume ack 2
+      discard await ps.receiveEvent()
+
+      await ps.unsubscribe(ch1)
+
+      let ev = await ps.receiveEvent()
+      doAssert ev.kind == pekUnsubscribe
+      doAssert ev.channel == ch1
+      doAssert ev.data == "1"
+
+      # still subscribed to ch2
+      doAssert ps.subscribed == true
+
+      # unsubscribe from ch2 and make sure the subscribed resets
+      let subFut1 = ps.waitSubscribed()
+      doAssert subFut0.finished == true
+      doAssert subFut1 == subFut0
+
+      await ps.unsubscribe(ch2)
+      let ev2 = await ps.receiveEvent()
+      doAssert ev2.kind == pekUnsubscribe
+      doAssert ev2.channel == ch2
+      doAssert ev2.data == "0"
+
+      doAssert ps.subscribed == false
+
+      let subFut2 = ps.waitSubscribed()
+      doAssert subFut2.finished == false
+      doAssert subFut2 != subFut0
+
+      await ps.close()
+      await base.close()
+      return true
+
+    check waitFor main()
 
   test "engine detection (async)":
     let valkeyFlag = waitFor r.isValkey()
