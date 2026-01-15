@@ -1564,7 +1564,7 @@ proc handleMessage*(ps: AsyncPubSub; frame: RedisList; ignoreSubscribeMessages=f
 proc receiveEvent*(ps: AsyncPubSub; ignoreSubscribeMessages=false): Future[PubSubEvent] {.async.} =
   # raise error if connection is None
   if ps.conn.isNil:
-    raise newException(ValueError, "pubsub connection not set: did you forget to call subscribe() or psubscribe()?")
+    raise newException(ValueError, "pubsub connection not set: did you forget to call subscribe(), psubscribe(), or ping()?")
   while true:
     let frame = await ps.parseResponse()
     let eventOpt = ps.handleMessage(frame, ignoreSubscribeMessages)
