@@ -129,7 +129,7 @@ type
     pendingUnsubShardChannels*: HashSet[string]
 
     subscribed*: bool # at least one active sub
-    subscribedFut*: Future[void] # comples when 0 -> >0, resets when >0 -> 0
+    subscribedFut*: Future[void] # completes when 0 -> >0, resets when >0 -> 0
 
     pendingPing: int
 
