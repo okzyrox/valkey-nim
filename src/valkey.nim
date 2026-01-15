@@ -114,7 +114,7 @@ type
     kind*: PubSubEventKind
     pattern*: string
     channel*: string
-    data*: string # TODO: perhaps add seperate field for integer data (subscribe/unsubscribe/...) and string data (pong/message/...) ?
+    data*: string # TODO: perhaps add separate field for integer data (subscribe/unsubscribe/...) and string data (pong/message/...) ?
 
   AsyncPubSub* = ref object
     params*: ValkeyConnParams
