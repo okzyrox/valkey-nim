@@ -1285,7 +1285,7 @@ proc pubsub*(c: AsyncValkey; ignoreSubscribeMessages=false): AsyncPubSub =
 proc connectValkeyAsync*(host = "localhost", port = 6379.Port, db = 0,
                         username = "", password = ""): Future[AsyncValkey]
 
-proc ensureConn*(ps: AsyncPubSub): Future[void] {.async.} =
+proc ensureConn(ps: AsyncPubSub): Future[void] {.async.} =
   ## Lazily create a AsyncValkey connection for the Pub/Sub instance
   if ps.conn.isNil:
     # NOTE: db not in params yet; use default 0
