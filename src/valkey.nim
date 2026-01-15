@@ -1483,12 +1483,12 @@ proc parseEvent*(response: openArray[string]): Option[PubSubEvent] =
     return some(event)
 
   else:
-    return none(PubSubEvent) # TODO: figure out what to do with "unknown" events. Maybe return an event with kind pekUnknown with channel/data...
+  return none(PubSubEvent) # TODO: figure out what to do with "unknown" events. Maybe return an event with kind pekUnknown with channel/data...
 
-proc subKey(ev : PubSubEvent): string =
+  proc subKey(ev: PubSubEvent): string =
   if ev.pattern.len > 0: ev.pattern else: ev.channel
 
-proc applyState(ps: AsyncPubSub; ev: PubSubEvent): void =
+  proc applyState(ps: AsyncPubSub; ev: PubSubEvent): void =
   let key = subKey(ev)
   if key.len == 0: return
 
