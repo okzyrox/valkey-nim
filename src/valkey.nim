@@ -1329,7 +1329,7 @@ proc waitSubscribed*(ps: AsyncPubSub): Future[void] =
   ## Resets with new future when subscriptions drop back to zero.
   ps.subscribedFut
 
-proc updateSubscribed*(ps: AsyncPubSub): void =
+proc updateSubscribed(ps: AsyncPubSub): void =
   # check for active subscription
   let now = ps.channels.len > 0 or ps.patterns.len > 0 or ps.shardChannels.len > 0
   # if the current state is the same as the saved state, no change
