@@ -78,10 +78,6 @@ type
     ## Pub/Sub
     channel*: string
     message*: string
-  # TODO: refactor error hierarchy
-  ReplyError* = object of IOError ## Invalid reply from valkey
-  ValkeyError* = object of IOError ## Error in valkey
-  PubSubError* = object of CatchableError
 
   ValkeyCursor* = ref object
     position*: BiggestInt
@@ -90,6 +86,17 @@ type
    ekUnknown,
    ekValkey,
    ekRedis
+
+  ## --- Errors ---
+  ValkeyError* = object of CatchableError  # default
+  ConnectionError* = object of ValkeyError # transport/socket
+  TimeoutError* = object of ValkeyError
+  ResponseError* = object of ValkeyError   # server returned bad reply (not a transport error).
+    code*: string # e.g., "ERR", "WRONGTYPE"
+    cmd*: string  # the command that caused the error
+  WatchError* = object of ValkeyError     # transaction error. Caller should retry the entire transaction.
+  ExecAbortError* = object of ValkeyError # EXEC aborted by valkey
+  PubSubError* = object of ValkeyError
 
   ## --- Redis aliases ---
 
