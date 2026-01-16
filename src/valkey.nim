@@ -78,8 +78,10 @@ type
     ## Pub/Sub
     channel*: string
     message*: string
+  # TODO: refactor error hierarchy
   ReplyError* = object of IOError ## Invalid reply from valkey
   ValkeyError* = object of IOError ## Error in valkey
+  PubSubError* = object of CatchableError
 
   ValkeyCursor* = ref object
     position*: BiggestInt
@@ -1421,7 +1423,7 @@ proc sunsubscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
 
 proc parseResponse*(ps: AsyncPubSub): Future[RedisList] {.async.} =
   if ps.conn.isNil:
-    raise newException(ValueError, "pubsub connection not set: did you forget to call a pubsub command (subscribe()/psubscribe()/ping())?") # TODO: better exception type here (eg PubSubError)
+    raise newException(PubSubError, "pubsub connection not set: did you forget to call a pubsub command (subscribe()/psubscribe()/ping())?")
   return await ps.conn.readPubSubFrame()
 
 proc stringToKind(s: string): PubSubEventKind =
@@ -1571,7 +1573,7 @@ proc handleMessage*(ps: AsyncPubSub; frame: RedisList; ignoreSubscribeMessages=f
 proc receiveEvent*(ps: AsyncPubSub; ignoreSubscribeMessages=false): Future[PubSubEvent] {.async.} =
   # raise error if connection is None
   if ps.conn.isNil:
-    raise newException(ValueError, "pubsub connection not set: did you forget to call subscribe(), psubscribe(), or ping()?")
+    raise newException(PubSubError, "pubsub connection not set: did you forget to call a pubsub command (subscribe()/psubscribe()/ping())?")
   while true:
     let frame = await ps.parseResponse()
     let eventOpt = ps.handleMessage(frame, ignoreSubscribeMessages)
