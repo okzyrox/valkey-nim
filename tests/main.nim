@@ -231,8 +231,13 @@ suite "valkey async tests":
       doAssert frame[1] == ch
       doAssert frame[2] == "1"
 
-      let ev = ps.handleMessage(frame)
-      doAssert ev.isSome
+      let evOpt = ps.handleMessage(frame)
+      doAssert evOpt.isSome
+      let ev = evOpt.get()
+      doAssert ev.kind == pekSubscribe
+      doAssert ev.channel == ch
+      doAssert ev.count == 1
+
       doAssert ps.subscribed == true
 
       await ps.close()
@@ -393,7 +398,7 @@ suite "valkey async tests":
       let ev = await ps.receiveEvent()
       doAssert ev.kind == pekUnsubscribe
       doAssert ev.channel == ch1
-      doAssert ev.data == "1"
+      doAssert ev.count == 1
 
       # still subscribed to ch2
       doAssert ps.subscribed == true
@@ -407,7 +412,7 @@ suite "valkey async tests":
       let ev2 = await ps.receiveEvent()
       doAssert ev2.kind == pekUnsubscribe
       doAssert ev2.channel == ch2
-      doAssert ev2.data == "0"
+      doAssert ev2.count == 0
 
       doAssert ps.subscribed == false
 
