@@ -114,7 +114,8 @@ type
     kind*: PubSubEventKind
     pattern*: string
     channel*: string
-    data*: string # TODO: perhaps add separate field for integer data (subscribe/unsubscribe/...) and string data (pong/message/...) ?
+    data*: string    # payload for message/pmessage/smessage/pong
+    count*: int      # subscription/unsubscribe/...; -1 when not applicable
 
   AsyncPubSub* = ref object
     params*: ValkeyConnParams
@@ -1441,7 +1442,7 @@ proc parseEvent*(response: openArray[string]): Option[PubSubEvent] =
   if response.len == 0: return none(PubSubEvent)
 
   let kind = stringToKind(response[0])
-  var event = PubSubEvent(kind: kind)
+  var event = PubSubEvent(kind: kind, count: -1)
 
   case kind
   of pekPMessage:
@@ -1472,23 +1473,29 @@ proc parseEvent*(response: openArray[string]): Option[PubSubEvent] =
     # ["psubscribe"|"punsubscribe", pattern, count]
     if response.len != 3: return none(PubSubEvent)
     event.pattern = response[1]
-    event.data = response[2]
+    try:
+      event.count = parseInt(response[2])
+    except ValueError:
+      return none(PubSubEvent)
     return some(event)
 
   of pekSubscribe, pekUnsubscribe, pekSSubscribe, pekSUnsubscribe:
     # ["subscribe"|"unsubscribe"|"ssubscribe"|"sunsubscribe", channel, count]
     if response.len != 3: return none(PubSubEvent)
     event.channel = response[1]
-    event.data = response[2]
+    try:
+      event.count = parseInt(response[2])
+    except ValueError:
+      return none(PubSubEvent)
     return some(event)
 
   else:
-  return none(PubSubEvent) # TODO: figure out what to do with "unknown" events. Maybe return an event with kind pekUnknown with channel/data...
+    return none(PubSubEvent) # TODO: figure out what to do with "unknown" events. Maybe return an event with kind pekUnknown with channel/data...
 
-  proc subKey(ev: PubSubEvent): string =
+proc subKey(ev: PubSubEvent): string =
   if ev.pattern.len > 0: ev.pattern else: ev.channel
 
-  proc applyState(ps: AsyncPubSub; ev: PubSubEvent): void =
+proc applyState(ps: AsyncPubSub; ev: PubSubEvent): void =
   let key = subKey(ev)
   if key.len == 0: return
 
