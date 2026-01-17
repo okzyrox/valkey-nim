@@ -90,14 +90,18 @@ type
   ## --- Errors ---
   ValkeyError* = object of CatchableError  # default
   ConnectionError* = object of ValkeyError # transport/socket
-  TimeoutError* = object of ValkeyError
-  ResponseError* = object of ValkeyError   # server returned bad reply (not a transport error).
+  TimeoutError* = object of ConnectionError
+  ProtocolError* = object of ValkeyError   # invalid reply
+  ResponseError* = object of ValkeyError   # server returned -ERR (not a transport error).
     code*: string # e.g., "ERR", "WRONGTYPE"
     cmd*: string  # the command that caused the error
   WatchError* = object of ValkeyError     # transaction error. Caller should retry the entire transaction.
   ExecAbortError* = object of ValkeyError # EXEC aborted by valkey
   PubSubError* = object of ValkeyError
 
+  # legacy error types (aliases)
+  ReplyError* = ProtocolError
+  RedisError* = ValkeyError
   ## --- Redis aliases ---
 
   Redis* = Valkey
@@ -107,7 +111,6 @@ type
   RedisString* = ValkeyString
   RedisList* = ValkeyList
   RedisMessage* = ValkeyMessage
-  RedisError* = ValkeyError
   RedisCursor* = ValkeyCursor
 
   ## --- Pub/Sub ---
@@ -142,6 +145,58 @@ type
     subscribedFut*: Future[void] # completes when 0 -> >0, resets when >0 -> 0
 
     pendingPing: int
+
+## Error helpers
+
+proc newValkeyError*(msg: string): ref ValkeyError =
+  result = newException(ValkeyError, msg)
+
+proc newConnError*(msg: string): ref ConnectionError =
+  result = newException(ConnectionError, msg)
+
+proc newTimeoutError*(msg: string): ref TimeoutError =
+  result = newException(TimeoutError, msg)
+
+proc newPubSubError*(msg: string): ref PubSubError =
+  result = newException(PubSubError, msg)
+
+proc newWatchError*(msg: string): ref WatchError =
+  result = newException(WatchError, msg)
+
+proc newExecAbortError*(msg: string): ref ExecAbortError =
+  result = newException(ExecAbortError, msg)
+
+proc newResponseError*(msg: string; code: string = ""; cmd: string = ""): ref ResponseError =
+  result = newException(ResponseError, msg)
+  result.code = code
+  result.cmd = cmd
+
+proc newProtocolError*(msg: string): ref ProtocolError =
+  result = newException(ProtocolError, msg)
+
+proc raiseValkeyError*(msg: string) =
+  raise newValkeyError(msg)
+
+proc raiseConnError*(msg: string) =
+  raise newConnError(msg)
+
+proc raiseTimeoutError*(msg: string) =
+  raise newTimeoutError(msg)
+
+proc raisePubSubError*(msg: string) =
+  raise newPubSubError(msg)
+
+proc raiseWatchError*(msg: string) =
+  raise newWatchError(msg)
+
+proc raiseExecAbortError*(msg: string) =
+  raise newExecAbortError(msg)
+
+proc raiseResponseError*(msg: string; code: string = ""; cmd: string = "") =
+  raise newResponseError(msg, code, cmd)
+
+proc raiseProtocolError*(msg: string) =
+  raise newProtocolError(msg)
 
 proc newPipeline(): Pipeline =
   new(result)
@@ -210,11 +265,11 @@ proc finaliseCommand(r: Redis | AsyncRedis) =
 
 proc raiseReplyError(r: Redis | AsyncRedis, msg: string) =
   finaliseCommand(r)
-  raise newException(ReplyError, msg)
+  raiseProtocolError(msg)
 
 proc raiseRedisError(r: Redis | AsyncRedis, msg: string) =
   finaliseCommand(r)
-  raise newException(RedisError, msg)
+  raiseValkeyError(msg)
 
 proc managedSend(
   r: Redis | AsyncRedis, data: string
