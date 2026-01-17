@@ -202,7 +202,7 @@ proc raiseProtocolError*(msg: string) =
 # TODO: Figure out how to merge with above? Trying to avoid the "legacy" finaliseCommand() getting called inside of pubsub.
 proc finaliseCommand(r: Redis | AsyncRedis)
 
-proc raiseConnectionErrorCmd*(r: Redis | AsyncRedis, msg: string) =
+proc raiseConnErrorCmd*(r: Redis | AsyncRedis, msg: string) =
   finaliseCommand(r)
   raiseConnError(msg)
 
@@ -317,11 +317,11 @@ proc managedRecv(
 
   when r is Redis:
     if r.socket.recv(result, size) != size:
-      raiseReplyError(r, "recv failed")
+      raiseConnErrorCmd(r, "recv failed")
   else:
     let numReceived = await r.socket.recvInto(addr result[0], size)
     if numReceived != size:
-      raiseReplyError(r, "recv failed")
+      raiseConnErrorCmd(r, "recv failed")
 
 proc managedRecvLine(r: Redis | AsyncRedis): Future[string] {.multisync.} =
   if r.pipeline.enabled:
@@ -389,7 +389,8 @@ proc parseInteger(r: Redis | AsyncRedis, line: string = ""): RedisInteger =
 proc readInteger(r: Redis | AsyncRedis): Future[RedisInteger] {.multisync.} =
   let line = await r.managedRecvLine()
   if line.len == 0:
-    return -1
+    if r.pipeline.enabled: return -1
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
 
   result = r.parseInteger(line)
   finaliseCommand(r)
@@ -397,8 +398,10 @@ proc readInteger(r: Redis | AsyncRedis): Future[RedisInteger] {.multisync.} =
 proc readSingleString(
   r: Redis | AsyncRedis, line: string, allowMBNil: bool
 ): Future[Option[RedisString]] {.multisync.} =
-  if r.pipeline.enabled:
-    return
+  if r.pipeline.enabled: return none(RedisString)
+
+  if line.len == 0:
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
 
   # Error.
   if line[0] == '-':
@@ -423,7 +426,8 @@ proc readSingleString(r: Redis | AsyncRedis): Future[RedisString] {.multisync.} 
   # TODO: Rename these style of procedures to `processSingleString`?
   let line = await r.managedRecvLine()
   if line.len == 0:
-    return ""
+    if r.pipeline.enabled: return ""
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
 
   let res = await r.readSingleString(line, allowMBNil = false)
   result = res.get(redisNil)
@@ -432,10 +436,16 @@ proc readSingleString(r: Redis | AsyncRedis): Future[RedisString] {.multisync.} 
 proc readNext(r: Redis): RedisList {.gcsafe.}
 proc readNext(r: AsyncRedis): Future[RedisList] {.gcsafe.}
 proc readArrayLines(r: Redis | AsyncRedis, countLine: string): Future[RedisList] {.multisync.} =
+  if countLine.len == 0:
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
   if countLine[0] != '*':
     raiseInvalidReply(r, '*', countLine[0])
+  var numElems: int
+  try:
+    numElems = parseInt(countLine.substr(1))
+  except ValueError:
+    raiseProtocolErrorCmd(r, "Unable to parse array length " & countLine)
 
-  var numElems = parseInt(countLine.substr(1))
   result = @[]
 
   if numElems == -1:
@@ -495,7 +505,8 @@ proc readArrayLines(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
 proc readBulkString(r: Redis | AsyncRedis, allowMBNil = false): Future[RedisString] {.multisync.} =
   let line = await r.managedRecvLine()
   if line.len == 0:
-    return ""
+    if r.pipeline.enabled: return ""
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
 
   let res = await r.readSingleString(line, allowMBNil)
   result = res.get(redisNil)
@@ -504,7 +515,8 @@ proc readBulkString(r: Redis | AsyncRedis, allowMBNil = false): Future[RedisStri
 proc readArray(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   let line = await r.managedRecvLine()
   if line.len == 0:
-    return @[]
+    if r.pipeline.enabled: return @[]
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
 
   result = await r.readArrayLines(line)
   finaliseCommand(r)
@@ -513,7 +525,8 @@ proc readNext(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   let line = await r.managedRecvLine()
 
   if line.len == 0:
-    return @[]
+    if r.pipeline.enabled: return @[]
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
 
   # TODO: This is no longer an expression due to
   # https://github.com/nim-lang/Nim/issues/8399
