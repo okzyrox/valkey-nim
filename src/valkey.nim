@@ -198,6 +198,30 @@ proc raiseResponseError*(msg: string; code: string = ""; cmd: string = "") =
 proc raiseProtocolError*(msg: string) =
   raise newProtocolError(msg)
 
+# helpers for cmd  execution paths that need to finalise command before raising
+# TODO: Figure out how to merge with above? Trying to avoid the "legacy" finaliseCommand() getting called inside of pubsub.
+proc finaliseCommand(r: Redis | AsyncRedis)
+
+proc raiseConnectionErrorCmd*(r: Redis | AsyncRedis, msg: string) =
+  finaliseCommand(r)
+  raiseConnError(msg)
+
+proc raiseTimeoutErrorCmd*(r: Redis | AsyncRedis, msg: string) =
+  finaliseCommand(r)
+  raiseTimeoutError(msg)
+
+proc raiseProtocolErrorCmd*(r: Redis | AsyncRedis, msg: string) =
+  finaliseCommand(r)
+  raiseProtocolError(msg)
+
+proc raiseResponseErrorCmd*(r: Redis | AsyncRedis, msg: string; code: string = ""; cmd: string = "") =
+  finaliseCommand(r)
+  raiseResponseError(msg, code, cmd)
+
+proc raiseValkeyErrorCmd*(r: Redis | AsyncRedis, msg: string) =
+  finaliseCommand(r)
+  raiseValkeyError(msg)
+
 proc newPipeline(): Pipeline =
   new(result)
   result.buffer = ""
@@ -264,12 +288,10 @@ proc finaliseCommand(r: Redis | AsyncRedis) =
       fut.complete()
 
 proc raiseReplyError(r: Redis | AsyncRedis, msg: string) =
-  finaliseCommand(r)
-  raiseProtocolError(msg)
+  raiseProtocolErrorCmd(r, msg)
 
 proc raiseRedisError(r: Redis | AsyncRedis, msg: string) =
-  finaliseCommand(r)
-  raiseValkeyError(msg)
+  raiseValkeyErrorCmd(r, msg)
 
 proc managedSend(
   r: Redis | AsyncRedis, data: string
