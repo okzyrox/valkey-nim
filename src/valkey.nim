@@ -323,6 +323,17 @@ proc managedRecv(
     if numReceived != size:
       raiseConnErrorCmd(r, "recv failed")
 
+proc managedRecvPubSub(r: Redis | AsyncRedis, size: int): Future[string] {.multisync.} =
+  ## Like managedRecv but doesn't finalise command state; raises ConnectionError on short read/EOF.
+  result = newString(size)
+  when r is Redis:
+    if r.socket.recv(result, size) != size:
+      raiseConnError("recv failed")
+  else:
+    let numReceived = await r.socket.recvInto(addr result[0], size)
+    if numReceived != size:
+      raiseConnError("recv failed")
+
 proc managedRecvLine(r: Redis | AsyncRedis): Future[string] {.multisync.} =
   if r.pipeline.enabled:
     result = ""
@@ -443,6 +454,32 @@ proc readSingleString(r: Redis | AsyncRedis): Future[RedisString] {.multisync.} 
   result = res.get(redisNil)
   finaliseCommand(r)
 
+proc readSingleStringPubSub(r: Redis | AsyncRedis, line: string, allowMBNil: bool): Future[Option[RedisString]] {.multisync.} =
+  if line.len == 0:
+    raiseConnError("Server closed connection prematurely")
+
+  # Error.
+  if line[0] == '-':
+    raiseResponseError(strip(line))
+
+  if allowMBNil and line == "$-1":
+    return none(RedisString)
+
+  if line[0] != '$':
+    raiseProtocolError("Expected '$' at the beginning of a bulk string reply got '" & $line[0] & "'")
+
+  var numBytes: int
+  try:
+    numBytes = parseInt(line.substr(1))
+  except ValueError:
+    raiseProtocolError("Unable to parse bulk string length " & line)
+
+  if numBytes == -1:
+    return none(RedisString)
+
+  var s = await r.managedRecvPubSub(numBytes + 2)
+  result = some(s[0 ..< numBytes]) # Strip \r\n
+
 proc readNext(r: Redis): RedisList {.gcsafe.}
 proc readNext(r: AsyncRedis): Future[RedisList] {.gcsafe.}
 proc readArrayLines(r: Redis | AsyncRedis, countLine: string): Future[RedisList] {.multisync.} =
@@ -484,7 +521,7 @@ proc readPubSubElement(r: Redis | AsyncRedis; firstLine: string): Future[string]
   of ':':
     return $(parseIntegerPubSub(firstLine))
   of '$':
-    let x = await r.readSingleString(firstLine, true)
+    let x = await r.readSingleStringPubSub(firstLine, true)
     return x.get(redisNil)
   of '*':
     # nested array: flatten with a delimiter or raise; Pub/Sub shouldn't have nested arrays
@@ -585,7 +622,7 @@ proc readPubSubFrame*(r: Redis | AsyncRedis): Future[RedisList] {.multisync, gcs
   of ':':
     return @[$(parseIntegerPubSub(line))]
   of '$':
-    let x = await r.readSingleString(line, true)
+    let x = await r.readSingleStringPubSub(line, true)
     return @[x.get(redisNil)]
   else:
     raiseProtocolError("readPubSubFrame failed on line: " & line)
