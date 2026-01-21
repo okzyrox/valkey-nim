@@ -96,8 +96,6 @@ type
   ResponseError* = object of ValkeyError   # server returned -ERR (not a transport error).
     code*: string # e.g., "ERR", "WRONGTYPE"
     cmd*: string  # the command that caused the error
-  # TODO : WatchErrors show up as *-1 from EXEC which is gets turned into @[];
-  # should  distinguish between EXEC (empty array) and EXEC (nil array)
   WatchError* = object of ValkeyError     # transaction error. Caller should retry the entire transaction.
   ExecAbortError* = object of ValkeyError # EXEC aborted by valkey
   PubSubError* = object of ValkeyError
@@ -204,6 +202,12 @@ proc raiseProtocolError*(msg: string) =
 # helpers for cmd  execution paths that need to finalise command before raising
 # TODO: Figure out how to merge with above? Trying to avoid the "legacy" finaliseCommand() getting called inside of pubsub.
 
+proc failAllSendQueue(r: AsyncRedis, e: ref Exception) =
+  while r.sendQueue.len > 0:
+    let fut = r.sendQueue.popFirst()
+    if not fut.finished:
+      fut.fail(e)
+
 proc cmdName(r: Redis | AsyncRedis): string =
   ## captures currentCommand before finaliseCommand clears it
   when r is AsyncRedis:
@@ -213,12 +217,22 @@ proc cmdName(r: Redis | AsyncRedis): string =
 proc finaliseCommand(r: Redis | AsyncRedis)
 
 proc raiseConnErrorCmd*(r: Redis | AsyncRedis, msg: string) =
-  finaliseCommand(r)
-  raiseConnError(msg)
+  when r is AsyncRedis:
+    let e = newConnError(msg)
+    r.currentCommand = none(string)
+    failAllSendQueue(r, e)
+    raise e
+  else:
+    raiseConnError(msg)
 
 proc raiseTimeoutErrorCmd*(r: Redis | AsyncRedis, msg: string) =
-  finaliseCommand(r)
-  raiseTimeoutError(msg)
+  when r is AsyncRedis:
+    let e = newTimeoutError(msg)
+    r.currentCommand = none(string)
+    failAllSendQueue(r, e)
+    raise e
+  else:
+    raiseTimeoutError(msg)
 
 proc raiseProtocolErrorCmd*(r: Redis | AsyncRedis, msg: string) =
   finaliseCommand(r)
@@ -321,7 +335,7 @@ proc raiseRedisError(r: Redis | AsyncRedis, msg: string) =
   raiseResponseErrorCmd(r, msg, code = respErrCode(msg))
 
 proc managedSend(
-  r: Redis | AsyncRedis, data: string
+  r: Redis | AsyncRedis, data: string, cmd: string = ""
 ): Future[void] {.multisync.} =
   when r is Redis:
     try:
@@ -335,7 +349,7 @@ proc managedSend(
       r.sendQueue.addLast(sendFut)
       await sendFut
 
-    r.currentCommand = some(data)
+    r.currentCommand = some(cmd)
     try:
       await r.socket.send(data)
     except CatchableError as e:
@@ -695,7 +709,7 @@ proc sendCommand(r: Redis | AsyncRedis, cmd: string): Future[void] {.multisync.}
     r.pipeline.buffer.add(request)
     r.pipeline.expected += 1
   else:
-    await r.managedSend(request)
+    await r.managedSend(request, cmd = cmd)
 
 proc sendCommand(
   r: Redis | AsyncRedis, cmd: string, args: seq[string]
@@ -711,7 +725,7 @@ proc sendCommand(
     r.pipeline.buffer.add(request)
     r.pipeline.expected += 1
   else:
-    await r.managedSend(request)
+    await r.managedSend(request, cmd = cmd)
 
 proc sendCommand(
   r: Redis | AsyncRedis, cmd: string, arg1: string
@@ -726,7 +740,7 @@ proc sendCommand(
     r.pipeline.expected += 1
     r.pipeline.buffer.add(request)
   else:
-    await r.managedSend(request)
+    await r.managedSend(request, cmd = cmd)
 
 proc sendCommand(r: Redis | AsyncRedis, cmd: string, arg1: string,
                  args: seq[string]): Future[void] {.multisync.} =
@@ -743,7 +757,7 @@ proc sendCommand(r: Redis | AsyncRedis, cmd: string, arg1: string,
     r.pipeline.expected += 1
     r.pipeline.buffer.add(request)
   else:
-    await r.managedSend(request)
+    await r.managedSend(request, cmd = cmd)
 
 # Keys
 
