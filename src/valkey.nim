@@ -424,7 +424,7 @@ proc parseIntegerPubSub(line: string): RedisInteger =
   if line.len == 0:
     raiseConnError("Server closed connection prematurely")
   if line[0] == '-':
-    raiseResponseError((strip(line)))
+    raiseResponseError((strip(line)),code = respErrCode(line))
   if line[0] != ':':
     raiseProtocolError("Expected ':' at the beginning of an integer reply")
   if parseBiggestInt(line, result, 1) == 0:
@@ -483,7 +483,7 @@ proc readSingleStringPubSub(r: Redis | AsyncRedis, line: string, allowMBNil: boo
 
   # Error.
   if line[0] == '-':
-    raiseResponseError(strip(line))
+    raiseResponseError(strip(line), code = respErrCode(line))
 
   if allowMBNil and line == "$-1":
     return none(RedisString)
@@ -540,7 +540,7 @@ proc readPubSubElement(r: Redis | AsyncRedis; firstLine: string): Future[string]
     # status: +PONG / +OK / etc
     return firstLine.substr(1)
   of '-':
-    raiseResponseError(strip(firstLine))
+    raiseResponseError(strip(firstLine), code = respErrCode(firstLine))
   of ':':
     return $(parseIntegerPubSub(firstLine))
   of '$':
@@ -641,7 +641,7 @@ proc readPubSubFrame*(r: Redis | AsyncRedis): Future[RedisList] {.multisync, gcs
   of '+':
     return @[line.substr(1)]
   of '-':
-    raiseResponseError(strip(line))
+    raiseResponseError(strip(line), code = respErrCode(line))
   of ':':
     return @[$(parseIntegerPubSub(line))]
   of '$':
