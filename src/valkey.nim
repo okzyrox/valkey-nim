@@ -348,8 +348,8 @@ proc parseStatus(r: Redis | AsyncRedis, line: string = ""): RedisStatus =
   if r.pipeline.enabled:
     return "PIPELINED"
 
-  if line == "":
-    raiseRedisError(r, "Server closed connection prematurely")
+  if line.len == 0:
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
 
   if line[0] == '-':
     raiseRedisError(r, strip(line))
@@ -371,11 +371,11 @@ proc parseInteger(r: Redis | AsyncRedis, line: string = ""): RedisInteger =
   if r.pipeline.enabled:
     return -1
 
+  if line.len == 0:
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
+
   #if line == "+QUEUED":  # inside of multi
   #  return -1
-
-  if line == "":
-    raiseRedisError(r, "Server closed connection prematurely")
 
   if line[0] == '-':
     raiseRedisError(r, strip(line))
@@ -385,6 +385,16 @@ proc parseInteger(r: Redis | AsyncRedis, line: string = ""): RedisInteger =
   # Strip ':'
   if parseBiggestInt(line, result, 1) == 0:
     raiseReplyError(r, "Unable to parse integer.")
+
+proc parseIntegerPubSub(line: string): RedisInteger =
+  if line.len == 0:
+    raiseConnError("Server closed connection prematurely")
+  if line[0] == '-':
+    raiseResponseError((strip(line)))
+  if line[0] != ':':
+    raiseProtocolError("Expected ':' at the beginning of an integer reply")
+  if parseBiggestInt(line, result, 1) == 0:
+    raiseProtocolError("Unable to parse integer: " & line)
 
 proc readInteger(r: Redis | AsyncRedis): Future[RedisInteger] {.multisync.} =
   let line = await r.managedRecvLine()
@@ -464,35 +474,41 @@ proc readArrayLines(r: Redis | AsyncRedis, countLine: string): Future[RedisList]
 
 proc readPubSubElement(r: Redis | AsyncRedis; firstLine: string): Future[string] {.multisync, gcsafe.} =
   if firstLine.len == 0:
-    raiseReplyError(r, "pubsub connection closed")
+    raiseConnError("pubsub connection closed")
   case firstLine[0]
   of '+':
     # status: +PONG / +OK / etc
     return firstLine.substr(1)
   of '-':
-    raiseRedisError(r, strip(firstLine))
+    raiseResponseError(strip(firstLine))
   of ':':
-    return $(r.parseInteger(firstLine))
+    return $(parseIntegerPubSub(firstLine))
   of '$':
     let x = await r.readSingleString(firstLine, true)
     return x.get(redisNil)
   of '*':
     # nested array: flatten with a delimiter or raise; Pub/Sub shouldn't have nested arrays
-    raiseReplyError(r, "Unexpected nested array in Pub/Sub element")
+    raiseProtocolError("Unexpected nested array in Pub/Sub message")
   else:
-    raiseReplyError(r, "readPubSubElement failed on line: " & firstLine)
+    raiseProtocolError("readPubSubElement failed on line: " & firstLine)
 
 proc readPubSubArrayLines(r: Redis | AsyncRedis; countLine: string):Future[RedisList] {.multisync, gcsafe.} =
-  if countLine.len == 0 or countLine[0] != '*':
-    raiseInvalidReply(r, '*', (if countLine.len == 0: '\0' else: countLine[0]))
-  let n = parseInt(countLine.substr(1))
+  if countLine.len == 0:
+    raiseConnError("pubsub connection closed")
+  if countLine[0] != '*':
+    raiseProtocolError("Expected '*' at the beginning of a Pub/Sub array reply got '" & $countLine[0] & "'")
+  var n: int
+  try:
+    n = parseInt(countLine.substr(1))
+  except ValueError:
+    raiseProtocolError("Unable to parse Pub/Sub array length " & countLine)
   result = @[]
   if n == -1:
     return
   for _ in 0..<n:
     let line = await r.managedRecvLine()
     if line.len == 0:
-      raiseReplyError(r, "pubsub connection closed")
+      raiseConnError("pubsub connection closed")
     result.add(await r.readPubSubElement(line))
 
 proc readArrayLines(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
@@ -556,7 +572,7 @@ proc readPubSubFrame*(r: Redis | AsyncRedis): Future[RedisList] {.multisync, gcs
 
   ## In pubsub, returning @[] is ambiguous and empty lines should trigger disconnect/EOF.
   if line.len == 0:
-    raiseReplyError(r, "pubsub connection closed")
+    raiseConnError("pubsub connection closed")
 
 
   case line[0]
@@ -565,14 +581,14 @@ proc readPubSubFrame*(r: Redis | AsyncRedis): Future[RedisList] {.multisync, gcs
   of '+':
     return @[line.substr(1)]
   of '-':
-    raiseRedisError(r, strip(line))
+    raiseResponseError(strip(line))
   of ':':
-    return @[$(r.parseInteger(line))]
+    return @[$(parseIntegerPubSub(line))]
   of '$':
     let x = await r.readSingleString(line, true)
     return @[x.get(redisNil)]
   else:
-    raiseReplyError(r, "readPubSubFrame failed on line: " & line)
+    raiseProtocolError("readPubSubFrame failed on line: " & line)
 
 proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] {.multisync.} =
   ## Send buffered commands, clear buffer, return results
