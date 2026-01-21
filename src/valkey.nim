@@ -290,8 +290,22 @@ proc finaliseCommand(r: Redis | AsyncRedis) =
 proc raiseReplyError(r: Redis | AsyncRedis, msg: string) =
   raiseProtocolErrorCmd(r, msg)
 
+proc respErrCode(msg: string): string =
+  var s  = msg.strip()
+  if s.len == 0: return ""
+
+  # error frames are "-<code> <message>"
+  if s[0] == '-':
+    if s.len == 1: return ""
+    s = s[1 .. ^1].strip()
+  let parts = s.splitWhitespace()
+  if parts.len == 0:
+    result = ""
+  else:
+    result = parts[0]
+
 proc raiseRedisError(r: Redis | AsyncRedis, msg: string) =
-  raiseValkeyErrorCmd(r, msg)
+  raiseResponseErrorCmd(r, msg, code = respErrCode(msg))
 
 proc managedSend(
   r: Redis | AsyncRedis, data: string
