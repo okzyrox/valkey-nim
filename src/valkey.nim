@@ -90,11 +90,14 @@ type
   ## --- Errors ---
   ValkeyError* = object of CatchableError  # default
   ConnectionError* = object of ValkeyError # transport/socket
+  # TODO: leave until we have timeouts implemented
   TimeoutError* = object of ConnectionError
   ProtocolError* = object of ValkeyError   # invalid reply
   ResponseError* = object of ValkeyError   # server returned -ERR (not a transport error).
     code*: string # e.g., "ERR", "WRONGTYPE"
     cmd*: string  # the command that caused the error
+  # TODO : WatchErrors show up as *-1 from EXEC which is gets turned into @[];
+  # should  distinguish between EXEC (empty array) and EXEC (nil array)
   WatchError* = object of ValkeyError     # transaction error. Caller should retry the entire transaction.
   ExecAbortError* = object of ValkeyError # EXEC aborted by valkey
   PubSubError* = object of ValkeyError
@@ -313,6 +316,7 @@ proc respErrCode(msg: string): string =
   else:
     result = parts[0]
 
+#TODO: add dedicated exception for ExecAbortError (-EXECABORT)
 proc raiseRedisError(r: Redis | AsyncRedis, msg: string) =
   raiseResponseErrorCmd(r, msg, code = respErrCode(msg))
 
@@ -320,18 +324,22 @@ proc managedSend(
   r: Redis | AsyncRedis, data: string
 ): Future[void] {.multisync.} =
   when r is Redis:
-    r.socket.send(data)
+    try:
+      r.socket.send(data)
+    except CatchableError as e:
+      raiseConnErrorCmd(r, "send failed: " & e.msg)
   else:
-    proc doSend() =
-      r.currentCommand = some(data)
-      asyncCheck r.socket.send(data)
     if r.currentCommand.isSome():
       # Queue this send.
       let sendFut = newFuture[void]("redis.managedSend")
       r.sendQueue.addLast(sendFut)
       await sendFut
 
-    doSend()
+    r.currentCommand = some(data)
+    try:
+      await r.socket.send(data)
+    except CatchableError as e:
+      raiseConnErrorCmd(r, "send failed: " & e.msg)
 
 proc managedRecv(
   r: Redis | AsyncRedis, size: int
