@@ -224,8 +224,21 @@ proc raiseConnErrorCmd*(r: Redis | AsyncRedis, msg: string) =
     let e = newConnError(msg)
     r.currentCommand = none(string)
     failAllSendQueue(r, e)
+
+    r.pipeline.enabled = false
+    r.pipeline.expected = 0
+    r.pipeline.buffer = ""
+
+    try: r.socket.close()
+    except CatchableError: discard
     raise e
   else:
+    r.pipeline.enabled = false
+    r.pipeline.expected = 0
+    r.pipeline.buffer = ""
+
+    try: r.socket.close()
+    except CatchableError: discard
     raiseConnError(msg)
 
 proc raiseTimeoutErrorCmd*(r: Redis | AsyncRedis, msg: string) =
@@ -233,8 +246,21 @@ proc raiseTimeoutErrorCmd*(r: Redis | AsyncRedis, msg: string) =
     let e = newTimeoutError(msg)
     r.currentCommand = none(string)
     failAllSendQueue(r, e)
+
+    r.pipeline.enabled = false
+    r.pipeline.expected = 0
+    r.pipeline.buffer = ""
+
+    try: r.socket.close()
+    except CatchableError: discard
     raise e
   else:
+    r.pipeline.enabled = false
+    r.pipeline.expected = 0
+    r.pipeline.buffer = ""
+
+    try: r.socket.close()
+    except CatchableError: discard
     raiseTimeoutError(msg)
 
 proc raiseProtocolErrorCmd*(r: Redis | AsyncRedis, msg: string) =
