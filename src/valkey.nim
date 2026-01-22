@@ -256,6 +256,10 @@ proc raiseValkeyErrorCmd*(r: Redis | AsyncRedis, msg: string) =
   finaliseCommand(r)
   raiseValkeyError(msg)
 
+proc raiseWatchErrorCmd*(r: Redis | AsyncRedis, msg: string) =
+  finaliseCommand(r)
+  raiseWatchError(msg)
+
 proc newPipeline(): Pipeline =
   new(result)
   result.buffer = ""
@@ -693,14 +697,28 @@ proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] 
   result = @[]
 
   var tot = r.pipeline.expected
-
-  for i in 0..tot-1:
-    var ret = await r.readNext()
-    for item in ret:
-     if not (item.contains("OK") or item.contains("QUEUED")):
-       result.add(item)
-
   r.pipeline.expected = 0
+
+  for i in 0..<tot:
+    if wasMulti and i == tot - 1:
+      let line = await r.managedRecvLine()
+      if line.len == 0:
+        raiseConnErrorCmd(r, "Server closed connection prematurely")
+      if line == "*-1":
+        raiseWatchErrorCmd(r, "Transaction aborted (WATCH conflict)")
+
+      let execRes = await r.readArrayLines(line)
+      finaliseCommand(r)
+
+      for item in execRes:
+        result.add(item)
+    else:
+      let ret = await r.readNext()
+      for item in ret:
+        if wasMulti and (item == "OK" or item == "QUEUED"):
+          discard
+        else:
+          result.add(item)
 
 proc startPipelining*(r: Redis | AsyncRedis) =
   ## Enable command pipelining (reduces network roundtrips).
