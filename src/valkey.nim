@@ -137,6 +137,7 @@ type
     channels*: HashSet[string]
     patterns*: HashSet[string]
     shardChannels*: HashSet[string]
+    # TODO: add a closed flag
 
     pendingUnsubChannels*: HashSet[string]
     pendingUnsubPatterns*: HashSet[string]
@@ -1509,6 +1510,12 @@ proc pubsub*(c: AsyncValkey; ignoreSubscribeMessages=false): AsyncPubSub =
   result.subscribed = false
   result.subscribedFut = newFuture[void]("pubsub.subscribed")
 
+proc resetState(ps: AsyncPubSub)
+proc requireConn(ps: AsyncPubSub): void =
+  ## Ensure that the Pub/Sub instance has a valid connection
+  if ps.conn.isNil:
+    raisePubSubError("pubsub connection not set: call subscribe/psubscribe/ping first")
+
 proc connectValkeyAsync*(host = "localhost", port = 6379.Port, db = 0,
                         username = "", password = ""): Future[AsyncValkey]
 
@@ -1538,7 +1545,17 @@ proc executeCommandImpl(ps: AsyncPubSub; argv: seq[string]): Future[void] {.asyn
   let req = encodeRespArray(argv)
   await ps.ensureConn()
   # IMPORTANT: bypass managedSend/SendCommand to avoid currentCommand/finalise coupling.
-  await ps.conn.socket.send(req) # send-only, no reads, no managedSend
+  try:
+    await ps.conn.socket.send(req) # send-only, no reads, no managedSend
+  except CatchableError as e:
+    if not ps.conn.isNil:
+      try:
+        ps.conn.socket.close()
+      except CatchableError:
+        discard
+      ps.conn = nil
+    ps.resetState()
+    raiseConnError("pubsub send failed: " & e.msg)
 
 proc executeCommand(ps: AsyncPubSub; argv: openArray[string]): Future[void] =
   # Execute with argv as is
@@ -1646,8 +1663,7 @@ proc sunsubscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
   return ps.executeCommand(argv)
 
 proc parseResponse*(ps: AsyncPubSub): Future[RedisList] {.async.} =
-  if ps.conn.isNil:
-    raise newException(PubSubError, "pubsub connection not set: did you forget to call a pubsub command (subscribe()/psubscribe()/ping())?")
+  ps.requireConn()
   return await ps.conn.readPubSubFrame()
 
 proc stringToKind(s: string): PubSubEventKind =
@@ -1796,8 +1812,6 @@ proc handleMessage*(ps: AsyncPubSub; frame: RedisList; ignoreSubscribeMessages=f
 
 proc receiveEvent*(ps: AsyncPubSub; ignoreSubscribeMessages=false): Future[PubSubEvent] {.async.} =
   # raise error if connection is None
-  if ps.conn.isNil:
-    raise newException(PubSubError, "pubsub connection not set: did you forget to call a pubsub command (subscribe()/psubscribe()/ping())?")
   while true:
     let frame = await ps.parseResponse()
     let eventOpt = ps.handleMessage(frame, ignoreSubscribeMessages)
