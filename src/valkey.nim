@@ -259,6 +259,8 @@ proc raiseProtocolErrorCmd*(r: Redis | AsyncRedis, msg: string) =
     except CatchableError: discard
     raiseProtocolError(msg)
 
+# TODO: best attempt, currently cmd tracking is only reliable for Async non-pipelined commands
+# adding cmd tracking to pipeline.cmd and sync mode (last send cmd stored in Valkey?) would help here
 proc raiseResponseErrorCmd*(r: Redis | AsyncRedis, msg: string; code: string = ""; cmd: string = "") =
   # capture cmd before finaliseCommand clears it (AsyncRedis only)
   let cmd0 = if cmd.len != 0: cmd else: cmdName(r)
@@ -361,6 +363,7 @@ proc respErrCode(msg: string): string =
   else:
     result = parts[0]
 
+# TODO: map common error codes to specific error types
 proc raiseRedisError(r: Redis | AsyncRedis, msg: string) =
   let code = respErrCode(msg)
   if code == "EXECABORT":
@@ -652,6 +655,7 @@ proc readArray(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   result = await r.readArrayLines(line)
   finaliseCommand(r)
 
+# TODO: pipeline.expected should count command responses, not array elements
 proc readNext(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   let line = await r.managedRecvLine()
 
@@ -708,7 +712,16 @@ proc readPubSubFrame*(r: Redis | AsyncRedis): Future[RedisList] {.multisync, gcs
 proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] {.multisync.} =
   ## Send buffered commands, clear buffer, return results
   if r.pipeline.buffer.len > 0:
-    await r.socket.send(r.pipeline.buffer)
+    try:
+      await r.socket.send(r.pipeline.buffer)
+    except CatchableError as e:
+      r.pipeline.enabled = false
+      r.pipeline.expected = 0
+      r.pipeline.buffer = ""
+      try: r.socket.close()
+      except CatchableError: discard
+      raiseConnErrorCmd(r, "send failed: " & e.msg)
+
   r.pipeline.buffer = ""
 
   r.pipeline.enabled = false
@@ -724,6 +737,10 @@ proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] 
         raiseConnErrorCmd(r, "Server closed connection prematurely")
       if line == "*-1":
         raiseWatchErrorCmd(r, "Transaction aborted (WATCH conflict)")
+      if line[0] == '-':
+        raiseRedisError(r, strip(line))
+      if line[0] != '*':
+        raiseProtocolErrorCmd(r, "Expected '*' at the beginning of an array reply got '" & $line[0] & "'")
 
       let execRes = await r.readArrayLines(line)
       finaliseCommand(r)
@@ -1528,6 +1545,7 @@ proc pubsub*(c: AsyncValkey; ignoreSubscribeMessages=false): AsyncPubSub =
   result.subscribedFut = newFuture[void]("pubsub.subscribed")
 
 proc resetState(ps: AsyncPubSub)
+proc close*(ps: AsyncPubSub): Future[void] {.async.}  # <-- add this forward decl
 proc requireConn(ps: AsyncPubSub): void =
   ## Ensure that the Pub/Sub instance has a valid connection
   if ps.conn.isNil:
@@ -1681,7 +1699,14 @@ proc sunsubscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
 
 proc parseResponse*(ps: AsyncPubSub): Future[RedisList] {.async.} =
   ps.requireConn()
-  return await ps.conn.readPubSubFrame()
+  try:
+    return await ps.conn.readPubSubFrame()
+  except ConnectionError, ProtocolError:
+    try:
+      await ps.close()
+    except CatchableError:
+      discard
+    raise
 
 proc stringToKind(s: string): PubSubEventKind =
   case s.toLowerAscii()
