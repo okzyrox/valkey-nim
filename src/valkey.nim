@@ -655,30 +655,25 @@ proc readArray(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   result = await r.readArrayLines(line)
   finaliseCommand(r)
 
-# TODO: pipeline.expected should count command responses, not array elements
 proc readNext(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   let line = await r.managedRecvLine()
-
   if line.len == 0:
     if r.pipeline.enabled: return @[]
     raiseConnErrorCmd(r, "Server closed connection prematurely")
 
   # TODO: This is no longer an expression due to
   # https://github.com/nim-lang/Nim/issues/8399
-  var res: RedisList = @[]
   case line[0]
-  of '+', '-': res = @[r.parseStatus(line)]
-  of ':': res = @[$(r.parseInteger(line))]
+  of '*': return await r.readArrayLines(line)
   of '$':
-    let x = await r.readSingleString(line, true)
-    res = @[x.get(redisNil)]
-  of '*':
-    res = await r.readArrayLines(line)
+    let x = await r.readSingleString(line, allowMBNil = true)
+    return @[x.get(redisNil)]
+  of ':': return @[$(r.parseInteger(line))]
+  of '+': return @[line.substr(1)]
+  of '-':
+    raiseRedisError(r, strip(line))
   else:
-    raiseReplyError(r, "readNext failed on line: " & line)
-
-  r.pipeline.expected -= 1
-  return res
+    raiseProtocolErrorCmd(r, "readNext failed on line: " & line)
 
 # TODO: RESP2 only for now - RESP3 push support later
 proc readPubSubFrame*(r: Redis | AsyncRedis): Future[RedisList] {.multisync, gcsafe.} =
@@ -723,13 +718,10 @@ proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] 
       raiseConnErrorCmd(r, "send failed: " & e.msg)
 
   r.pipeline.buffer = ""
-
   r.pipeline.enabled = false
   result = @[]
 
-  var tot = r.pipeline.expected
-  r.pipeline.expected = 0
-
+  let tot = r.pipeline.expected
   for i in 0..<tot:
     if wasMulti and i == tot - 1:
       let line = await r.managedRecvLine()
@@ -754,6 +746,8 @@ proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] 
           discard
         else:
           result.add(item)
+
+  r.pipeline.expected = 0
 
 proc startPipelining*(r: Redis | AsyncRedis) =
   ## Enable command pipelining (reduces network roundtrips).
