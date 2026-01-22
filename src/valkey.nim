@@ -242,10 +242,19 @@ proc raiseProtocolErrorCmd*(r: Redis | AsyncRedis, msg: string) =
     let e = newProtocolError(msg)
     r.currentCommand = none(string)
     failAllSendQueue(r, e)
+
+    r.pipeline.enabled = false
+    r.pipeline.expected = 0
+    r.pipeline.buffer = ""
+
     try: r.socket.close()
     except CatchableError: discard
     raise e
   else:
+    r.pipeline.enabled = false
+    r.pipeline.expected = 0
+    r.pipeline.buffer = ""
+
     try: r.socket.close()
     except CatchableError: discard
     raiseProtocolError(msg)
