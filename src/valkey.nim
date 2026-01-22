@@ -238,8 +238,17 @@ proc raiseTimeoutErrorCmd*(r: Redis | AsyncRedis, msg: string) =
     raiseTimeoutError(msg)
 
 proc raiseProtocolErrorCmd*(r: Redis | AsyncRedis, msg: string) =
-  finaliseCommand(r)
-  raiseProtocolError(msg)
+  when r is AsyncRedis:
+    let e = newProtocolError(msg)
+    r.currentCommand = none(string)
+    failAllSendQueue(r, e)
+    try: r.socket.close()
+    except CatchableError: discard
+    raise e
+  else:
+    try: r.socket.close()
+    except CatchableError: discard
+    raiseProtocolError(msg)
 
 proc raiseResponseErrorCmd*(r: Redis | AsyncRedis, msg: string; code: string = ""; cmd: string = "") =
   # capture cmd before finaliseCommand clears it (AsyncRedis only)
