@@ -432,10 +432,9 @@ proc parseStatus(r: Redis | AsyncRedis, line: string = ""): RedisStatus =
 
 proc readStatus(r: Redis | AsyncRedis): Future[RedisStatus] {.multisync.} =
   let line = await r.managedRecvLine()
-
   if line.len == 0:
-    return "PIPELINED"
-
+    if r.pipeline.enabled: return "PIPELINED"
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
   result = r.parseStatus(line)
   finaliseCommand(r)
 
@@ -612,8 +611,8 @@ proc readPubSubArrayLines(r: Redis | AsyncRedis; countLine: string):Future[Redis
 proc readArrayLines(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   let line = await r.managedRecvLine()
   if line.len == 0:
-    return @[]
-
+    if r.pipeline.enabled: return @[]
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
   result = await r.readArrayLines(line)
 
 proc readBulkString(r: Redis | AsyncRedis, allowMBNil = false): Future[RedisString] {.multisync.} =
