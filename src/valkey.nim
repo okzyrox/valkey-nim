@@ -96,8 +96,8 @@ type
   ResponseError* = object of ValkeyError   # server returned -ERR (not a transport error).
     code*: string # e.g., "ERR", "WRONGTYPE"
     cmd*: string  # the command that caused the error
+  ExecAbortError* = object of ResponseError
   WatchError* = object of ValkeyError     # transaction error. Caller should retry the entire transaction.
-  ExecAbortError* = object of ValkeyError # EXEC aborted by valkey
   PubSubError* = object of ValkeyError
 
   # legacy error types (aliases)
@@ -164,11 +164,13 @@ proc newPubSubError*(msg: string): ref PubSubError =
 proc newWatchError*(msg: string): ref WatchError =
   result = newException(WatchError, msg)
 
-proc newExecAbortError*(msg: string): ref ExecAbortError =
-  result = newException(ExecAbortError, msg)
-
 proc newResponseError*(msg: string; code: string = ""; cmd: string = ""): ref ResponseError =
   result = newException(ResponseError, msg)
+  result.code = code
+  result.cmd = cmd
+
+proc newExecAbortError*(msg: string; code: string = "EXECABORT"; cmd: string = ""): ref ExecAbortError =
+  result = newException(ExecAbortError, msg)
   result.code = code
   result.cmd = cmd
 
@@ -190,8 +192,8 @@ proc raisePubSubError*(msg: string) =
 proc raiseWatchError*(msg: string) =
   raise newWatchError(msg)
 
-proc raiseExecAbortError*(msg: string) =
-  raise newExecAbortError(msg)
+proc raiseExecAbortError*(msg: string; code: string = "EXECABORT"; cmd: string = "") =
+  raise newExecAbortError(msg, code, cmd)
 
 proc raiseResponseError*(msg: string; code: string = ""; cmd: string = "") =
   raise newResponseError(msg, code, cmd)
@@ -243,6 +245,12 @@ proc raiseResponseErrorCmd*(r: Redis | AsyncRedis, msg: string; code: string = "
   let cmd0 = if cmd.len != 0: cmd else: cmdName(r)
   finaliseCommand(r)
   raiseResponseError(msg, code = code, cmd = cmd0)
+
+proc raiseExecAbortErrorCmd*(r: Redis | AsyncRedis, msg: string; code: string = "EXECABORT"; cmd: string = "") =
+  # capture cmd before finaliseCommand clears it (AsyncRedis only)
+  let cmd0 = if cmd.len != 0: cmd else: cmdName(r)
+  finaliseCommand(r)
+  raiseExecAbortError(msg, code = code, cmd = cmd0)
 
 proc raiseValkeyErrorCmd*(r: Redis | AsyncRedis, msg: string) =
   finaliseCommand(r)
@@ -330,9 +338,12 @@ proc respErrCode(msg: string): string =
   else:
     result = parts[0]
 
-#TODO: add dedicated exception for ExecAbortError (-EXECABORT)
 proc raiseRedisError(r: Redis | AsyncRedis, msg: string) =
-  raiseResponseErrorCmd(r, msg, code = respErrCode(msg))
+  let code = respErrCode(msg)
+  if code == "EXECABORT":
+    raiseExecAbortErrorCmd(r, msg, code = code)
+  else:
+    raiseResponseErrorCmd(r, msg, code = code)
 
 proc managedSend(
   r: Redis | AsyncRedis, data: string, cmd: string = ""
