@@ -124,6 +124,14 @@ template syncTests() =
 
     check valkeyFlag or redisFlag
 
+  test "wrongtype raises ResponseError (sync)":
+    r.setk("redisTest:wrongType", "x")
+    try:
+      discard r.lPush("redisTest:wrongType", "y")
+      check false # should not reach here
+    except ResponseError as e:
+      check e.code == "WRONGTYPE"
+
   test "pipeline flush works":
     r.startPipelining()
     r.setk("pipelineTest:key1", "value1")
@@ -143,6 +151,19 @@ suite "valkey async tests":
   let r = waitFor connectTest(AsyncValkey)
   let keys = waitFor r.keys("*")
   doAssert keys.len == 0, "Don't want to mess up an existing DB."
+
+  test "wrongtype raises ResponseError (async)":
+    proc main(): Future[bool] {.async.} =
+      await r.setk("redisTestAsync:wrongType", "x")
+      try:
+        discard await r.lPush("redisTestAsync:wrongType", "y")
+        return false # should not reach here
+      except ResponseError as e:
+        check e.code == "WRONGTYPE"
+        check e.cmd.toUpperAscii() == "LPUSH"
+        return true
+
+    check waitFor main()
 
   test "issue #6":
     # See `tawaitorder` for a test that doesn't depend on Redis.
