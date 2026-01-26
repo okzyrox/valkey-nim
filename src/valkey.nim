@@ -543,7 +543,11 @@ proc readSingleString(
   if line[0] != '$':
     raiseInvalidReply(r, '$', line[0])
 
-  var numBytes = parseInt(line.substr(1))
+  var numBytes: int
+  try:
+    numBytes = parseInt(line.substr(1))
+  except ValueError:
+    raiseProtocolErrorCmd(r, "Unable to parse bulk string length " & line)
   if numBytes == -1:
     return
 
@@ -648,7 +652,7 @@ proc readPubSubArrayLines(r: Redis | AsyncRedis; countLine: string):Future[Redis
     raiseProtocolError("Unable to parse Pub/Sub array length " & countLine)
   result = @[]
   if n == -1:
-    return
+    raiseProtocolError("Unexpected nil array (*-1) in Pub/Sub frame")
   for _ in 0..<n:
     let line = await r.managedRecvLine()
     if line.len == 0:
@@ -748,6 +752,9 @@ proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] 
   result = @[]
 
   let tot = r.pipeline.expected
+  defer:
+    r.pipeline.expected = 0
+
   for i in 0..<tot:
     if wasMulti and i == tot - 1:
       let line = await r.managedRecvLine()
@@ -781,6 +788,7 @@ proc startPipelining*(r: Redis | AsyncRedis) =
   ## for multi/exec() which enable and flush the pipeline automatically.
   ## Commands return immediately with dummy values; actual results returned from
   ## flushPipeline() or exec()
+  r.pipeline.buffer = "" # clear buffer so stale commands aren't sent
   r.pipeline.expected = 0
   r.pipeline.enabled = true
 
