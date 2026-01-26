@@ -136,8 +136,15 @@ template syncTests() =
     r.startPipelining()
     r.setk("pipelineTest:key1", "value1")
     discard r.get("pipelineTest:key1")
+    discard r.keys("pipelineTest:*")
     let replies = r.flushPipeline()
     check replies.contains("value1")
+    check replies.contains("pipelineTest:key1")
+
+    # pipeline should be reset
+    check r.get("pipelineTest:key1") == "value1"
+    let ks = r.keys("pipelineTest:*")
+    check ks.contains("pipelineTest:key1")
 
   # TODO: Ideally tests for all other procedures, will add these in the future
 
