@@ -734,8 +734,42 @@ proc readPubSubFrame*(r: Redis | AsyncRedis): Future[RedisList] {.multisync, gcs
   else:
     raiseProtocolError("readPubSubFrame failed on line: " & line)
 
+proc drainRespFrame(r: Redis | AsyncRedis; firstLine = ""): Future[void] {.multisync.} =
+  ## consume one RESP2 frame from the socket
+  var line = firstLine
+  if line.len == 0:
+    line = await r.managedRecvLine() # if caller already read first line, pass the header line in
+  if line.len == 0:
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
+  case line[0]
+  of '+', '-', ':': # status, error, integer (ie scalar)
+    discard
+  of '$': # bulk string
+    var n: int
+    try:
+      n = parseInt(line.substr(1))
+    except ValueError:
+      raiseProtocolErrorCmd(r, "Unable to parse bulk string length " & line)
+    if n>=0:
+      discard await r.managedRecv(n + 2) # payload + \r\n
+    # $-1 is nil bulk string, nothing to read
+  of '*': # array
+    var n: int 
+    try:
+      n = parseInt(line.substr(1))
+    except ValueError:
+      raiseProtocolErrorCmd(r, "Unable to parse array length " & line)
+    if n >= 0:
+      for _ in 0..<n:
+        await r.drainRespFrame()
+    # *-1 is nil array, nothing to read
+  else:
+    raiseProtocolErrorCmd(r, "Unknown RESP frame type: " & line)
+
 proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] {.multisync.} =
   ## Send buffered commands, clear buffer, return results
+
+  # push commands in pipeline buffer, if send fails disable pipelining, close connection, raise
   if r.pipeline.buffer.len > 0:
     try:
       await r.socket.send(r.pipeline.buffer)
@@ -747,15 +781,27 @@ proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] 
       except CatchableError: discard
       raiseConnErrorCmd(r, "send failed: " & e.msg)
 
+  # enter "read and reply" phase, clean buffer and disable pipelining
   r.pipeline.buffer = ""
   r.pipeline.enabled = false
   result = @[]
 
+  # read replies
   let tot = r.pipeline.expected
   defer:
     r.pipeline.expected = 0
 
+  # remeber first server error but keep draining so socket stays in sync
+  var firstServerError: ref Exception = nil
+
+  # each iteration reads one reply except for multi/exec when command returns array
   for i in 0..<tot:
+    if not firstServerError.isNil:
+      # if an error is already seen, drain only
+      await r.drainRespFrame()
+      continue
+
+    # EXEC reply
     if wasMulti and i == tot - 1:
       let line = await r.managedRecvLine()
       if line.len == 0:
@@ -767,21 +813,55 @@ proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] 
       if line[0] != '*':
         raiseProtocolErrorCmd(r, "Expected '*' at the beginning of an array reply got '" & $line[0] & "'")
 
-      let execRes = await r.readArrayLines(line)
+      # parse array
+      var n: int
+      try:
+        n = parseInt(line.substr(1))
+      except ValueError:
+        raiseProtocolErrorCmd(r, "Unable to parse array length " & line)
+
+      if n == -1:
+        raiseWatchErrorCmd(r, "Transaction aborted (WATCH conflict)")
+
+      # read n elements of the array
+      for _ in 0..<n:
+        if not firstServerError.isNil:
+          await r.drainRespFrame()
+          continue
+
+        try:
+          let elem = await r.readNext()
+          for item in elem:
+            result.add(item)
+        except ResponseError:
+          if firstServerError.isNil:
+            firstServerError = getCurrentException()
+        except ExecAbortError:
+          if firstServerError.isNil:
+            firstServerError = getCurrentException()
       finaliseCommand(r)
 
-      for item in execRes:
-        result.add(item)
+    # normal reply
     else:
-      let ret = await r.readNext()
-      for item in ret:
-        if wasMulti and (item == "OK" or item == "QUEUED"):
-          discard
-        else:
-          result.add(item)
+      try:
+        let ret = await r.readNext()
+        for item in ret:
+          if wasMulti and (item == "OK" or item == "QUEUED"):
+            discard
+          else:
+            result.add(item)
+      except ResponseError:
+        if firstServerError.isNil:
+          firstServerError = getCurrentException()
+      except ExecAbortError:
+        if firstServerError.isNil:
+          firstServerError = getCurrentException()
 
-  r.pipeline.expected = 0
+  if not firstServerError.isNil:
+    raise firstServerError
 
+# TODO: Async pipelining/flushPipeline assumes execlusive access to the connection
+# not safe with concurrent commands. Futre: add per-connection IO lock or dedicated reader/writer task.
 proc startPipelining*(r: Redis | AsyncRedis) =
   ## Enable command pipelining (reduces network roundtrips).
   ## Note that when enabled, you must call flushPipeline to actually send commands, except

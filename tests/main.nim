@@ -146,6 +146,24 @@ template syncTests() =
     let ks = r.keys("pipelineTest:*")
     check ks.contains("pipelineTest:key1")
 
+  test "pipeline flush drains after server error":
+    r.startPipelining()
+    r.setk("pipelineTest:desync:key", "x")
+    discard r.lPush("pipelineTest:desync:key", "y")  # wrong type error
+    discard r.get("pipelineTest:desync:key")
+    discard r.incr("pipelineTest:desync:counter")
+
+    try:
+      discard r.flushPipeline()
+      check false # should not reach here
+    except ResponseError as e:
+      check e.code == "WRONGTYPE"
+
+    # if flushPipeline didn't drain, this get would read leftover "x" and fail
+    check r.get("pipelineTest:desync:counter") == "1"
+    check r.get("pipelineTest:desync:key") == "x"
+    check r.incr("pipelineTest:desync:counter") == 2
+
   # TODO: Ideally tests for all other procedures, will add these in the future
 
   # delete all keys in the DB at the end of the tests
