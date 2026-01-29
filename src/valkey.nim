@@ -768,8 +768,11 @@ proc drainRespFrame(r: Redis | AsyncRedis; firstLine = ""): Future[void] {.multi
 
 proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] {.multisync.} =
   ## Send buffered commands, clear buffer, return results
-
   # push commands in pipeline buffer, if send fails disable pipelining, close connection, raise
+  when r is AsyncRedis:
+    if r.currentCommand.isSome() or r.sendQueue.len > 0:
+      raise newValkeyError("flushPipeline requires exclusive access to the connection")
+
   if r.pipeline.buffer.len > 0:
     try:
       await r.socket.send(r.pipeline.buffer)
@@ -833,10 +836,10 @@ proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] 
           let elem = await r.readNext()
           for item in elem:
             result.add(item)
-        except ResponseError:
+        except ExecAbortError:
           if firstServerError.isNil:
             firstServerError = getCurrentException()
-        except ExecAbortError:
+        except ResponseError:
           if firstServerError.isNil:
             firstServerError = getCurrentException()
       finaliseCommand(r)
@@ -850,10 +853,10 @@ proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] 
             discard
           else:
             result.add(item)
-      except ResponseError:
+      except ExecAbortError:
         if firstServerError.isNil:
           firstServerError = getCurrentException()
-      except ExecAbortError:
+      except ResponseError:
         if firstServerError.isNil:
           firstServerError = getCurrentException()
 
