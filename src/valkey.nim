@@ -45,7 +45,10 @@ type
   Pipeline = ref object
     enabled: bool
     buffer: string
-    expected: int ## number of replies expected if pipelined
+    expected: int
+    ## expected: increments once per queued command added to buffer (via sendCommand with pipelining).
+    ## It equals the number of top-level replies that must be read after sending buffer.
+    ## For multi/exec, the elements inside the EXEC array reply are not counted in expected.
 
   ValkeyBase[TSocket] = ref object of RootObj
     socket: TSocket
@@ -768,8 +771,16 @@ proc drainRespFrame(r: Redis | AsyncRedis; firstLine = ""): Future[void] {.multi
 
 proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] {.multisync.} =
   ## Send buffered commands, clear buffer, return results
-  # push commands in pipeline buffer, if send fails disable pipelining, close connection, raise
+  ## After sending pipeline.buffer, exactly pipeline.expected top-level replies are read.
+  ##
+  ## Server reply error (ResponseError / ExecAbortError) are deferred until the remaining
+  ## replies are drained via drainRespFrame (no partial results are returned on error).
+  ##
+  ## Transport/protocol errors raise immediately.
+  ## TODO: consider a "collect all" variant that returns partial results and all errors.
   when r is AsyncRedis:
+    ## Pipelined sends bypass managedSend() and sendQueue,
+    ## so flushPipeline needs exclusive access to the connection.
     if r.currentCommand.isSome() or r.sendQueue.len > 0:
       raise newValkeyError("flushPipeline requires exclusive access to the connection")
 
