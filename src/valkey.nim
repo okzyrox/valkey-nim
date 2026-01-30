@@ -788,11 +788,6 @@ proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] 
     try:
       await r.socket.send(r.pipeline.buffer)
     except CatchableError as e:
-      r.pipeline.enabled = false
-      r.pipeline.expected = 0
-      r.pipeline.buffer = ""
-      try: r.socket.close()
-      except CatchableError: discard
       raiseConnErrorCmd(r, "send failed: " & e.msg)
 
   # enter "read and reply" phase, clean buffer and disable pipelining
