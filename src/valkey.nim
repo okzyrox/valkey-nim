@@ -49,6 +49,7 @@ type
     ## expected: increments once per queued command added to buffer (via sendCommand with pipelining).
     ## It equals the number of top-level replies that must be read after sending buffer.
     ## For multi/exec, the elements inside the EXEC array reply are not counted in expected.
+    ## TODO: add inMulti flag
 
   ValkeyBase[TSocket] = ref object of RootObj
     socket: TSocket
@@ -779,16 +780,22 @@ proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] 
   ## Transport/protocol errors raise immediately.
   ## TODO: consider a "collect all" variant that returns partial results and all errors.
   when r is AsyncRedis:
-    ## Pipelined sends bypass managedSend() and sendQueue,
+    ## Pipelined bypass managedSend() (which uses sendQueue),
     ## so flushPipeline needs exclusive access to the connection.
     if r.currentCommand.isSome() or r.sendQueue.len > 0:
       raise newValkeyError("flushPipeline requires exclusive access to the connection")
 
   if r.pipeline.buffer.len > 0:
-    try:
-      await r.socket.send(r.pipeline.buffer)
-    except CatchableError as e:
-      raiseConnErrorCmd(r, "send failed: " & e.msg)
+    when r is Redis:
+      try:
+        r.socket.send(r.pipeline.buffer)
+      except CatchableError as e:
+        raiseConnErrorCmd(r, "send failed: " & e.msg)
+    else:
+      try:
+        await r.socket.send(r.pipeline.buffer)
+      except CatchableError as e:
+        raiseConnErrorCmd(r, "send failed: " & e.msg)
 
   # enter "read and reply" phase, clean buffer and disable pipelining
   r.pipeline.buffer = ""
@@ -800,7 +807,7 @@ proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] 
   defer:
     r.pipeline.expected = 0
 
-  # remeber first server error but keep draining so socket stays in sync
+  # remember first server error but keep draining so socket stays in sync
   var firstServerError: ref Exception = nil
 
   # each iteration reads one reply except for multi/exec when command returns array
@@ -848,7 +855,6 @@ proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] 
         except ResponseError:
           if firstServerError.isNil:
             firstServerError = getCurrentException()
-      finaliseCommand(r)
 
     # normal reply
     else:
