@@ -45,7 +45,11 @@ type
   Pipeline = ref object
     enabled: bool
     buffer: string
-    expected: int ## number of replies expected if pipelined
+    expected: int
+    ## expected: increments once per queued command added to buffer (via sendCommand with pipelining).
+    ## It equals the number of top-level replies that must be read after sending buffer.
+    ## For multi/exec, the elements inside the EXEC array reply are not counted in expected.
+    ## TODO: add inMulti flag
 
   ValkeyBase[TSocket] = ref object of RootObj
     socket: TSocket
@@ -78,10 +82,6 @@ type
     ## Pub/Sub
     channel*: string
     message*: string
-  # TODO: refactor error hierarchy
-  ReplyError* = object of IOError ## Invalid reply from valkey
-  ValkeyError* = object of IOError ## Error in valkey
-  PubSubError* = object of CatchableError
 
   ValkeyCursor* = ref object
     position*: BiggestInt
@@ -91,6 +91,22 @@ type
    ekValkey,
    ekRedis
 
+  ## --- Errors ---
+  ValkeyError* = object of CatchableError  # default
+  ConnectionError* = object of ValkeyError # transport/socket
+  # TODO: leave until we have timeouts implemented
+  TimeoutError* = object of ConnectionError
+  ProtocolError* = object of ValkeyError   # invalid reply
+  ResponseError* = object of ValkeyError   # server returned -ERR (not a transport error).
+    code*: string # e.g., "ERR", "WRONGTYPE"
+    cmd*: string  # the command that caused the error
+  ExecAbortError* = object of ResponseError
+  WatchError* = object of ValkeyError     # transaction error. Caller should retry the entire transaction.
+  PubSubError* = object of ValkeyError
+
+  # legacy error types (aliases)
+  ReplyError* = ProtocolError
+  RedisError* = ValkeyError
   ## --- Redis aliases ---
 
   Redis* = Valkey
@@ -100,7 +116,6 @@ type
   RedisString* = ValkeyString
   RedisList* = ValkeyList
   RedisMessage* = ValkeyMessage
-  RedisError* = ValkeyError
   RedisCursor* = ValkeyCursor
 
   ## --- Pub/Sub ---
@@ -126,6 +141,7 @@ type
     channels*: HashSet[string]
     patterns*: HashSet[string]
     shardChannels*: HashSet[string]
+    # TODO: add a closed flag
 
     pendingUnsubChannels*: HashSet[string]
     pendingUnsubPatterns*: HashSet[string]
@@ -135,6 +151,165 @@ type
     subscribedFut*: Future[void] # completes when 0 -> >0, resets when >0 -> 0
 
     pendingPing: int
+
+## Error helpers
+
+proc newValkeyError*(msg: string): ref ValkeyError =
+  result = newException(ValkeyError, msg)
+
+proc newConnError*(msg: string): ref ConnectionError =
+  result = newException(ConnectionError, msg)
+
+proc newTimeoutError*(msg: string): ref TimeoutError =
+  result = newException(TimeoutError, msg)
+
+proc newPubSubError*(msg: string): ref PubSubError =
+  result = newException(PubSubError, msg)
+
+proc newWatchError*(msg: string): ref WatchError =
+  result = newException(WatchError, msg)
+
+proc newResponseError*(msg: string; code: string = ""; cmd: string = ""): ref ResponseError =
+  result = newException(ResponseError, msg)
+  result.code = code
+  result.cmd = cmd
+
+proc newExecAbortError*(msg: string; code: string = "EXECABORT"; cmd: string = ""): ref ExecAbortError =
+  result = newException(ExecAbortError, msg)
+  result.code = code
+  result.cmd = cmd
+
+proc newProtocolError*(msg: string): ref ProtocolError =
+  result = newException(ProtocolError, msg)
+
+proc raiseValkeyError*(msg: string) =
+  raise newValkeyError(msg)
+
+proc raiseConnError*(msg: string) =
+  raise newConnError(msg)
+
+proc raiseTimeoutError*(msg: string) =
+  raise newTimeoutError(msg)
+
+proc raisePubSubError*(msg: string) =
+  raise newPubSubError(msg)
+
+proc raiseWatchError*(msg: string) =
+  raise newWatchError(msg)
+
+proc raiseExecAbortError*(msg: string; code: string = "EXECABORT"; cmd: string = "") =
+  raise newExecAbortError(msg, code, cmd)
+
+proc raiseResponseError*(msg: string; code: string = ""; cmd: string = "") =
+  raise newResponseError(msg, code, cmd)
+
+proc raiseProtocolError*(msg: string) =
+  raise newProtocolError(msg)
+
+# helpers for cmd  execution paths that need to finalise command before raising
+# TODO: Figure out how to merge with above? Trying to avoid the "legacy" finaliseCommand() getting called inside of pubsub.
+
+proc failAllSendQueue(r: AsyncRedis, e: ref Exception) =
+  while r.sendQueue.len > 0:
+    let fut = r.sendQueue.popFirst()
+    if not fut.finished:
+      fut.fail(e)
+
+proc cmdName(r: Redis | AsyncRedis): string =
+  ## captures currentCommand before finaliseCommand clears it
+  when r is AsyncRedis:
+    result = r.currentCommand.get("") # Option[string] -> string
+  else:
+    result = ""
+proc finaliseCommand(r: Redis | AsyncRedis)
+
+proc raiseConnErrorCmd*(r: Redis | AsyncRedis, msg: string) =
+  when r is AsyncRedis:
+    let e = newConnError(msg)
+    r.currentCommand = none(string)
+    failAllSendQueue(r, e)
+
+    r.pipeline.enabled = false
+    r.pipeline.expected = 0
+    r.pipeline.buffer = ""
+
+    try: r.socket.close()
+    except CatchableError: discard
+    raise e
+  else:
+    r.pipeline.enabled = false
+    r.pipeline.expected = 0
+    r.pipeline.buffer = ""
+
+    try: r.socket.close()
+    except CatchableError: discard
+    raiseConnError(msg)
+
+proc raiseTimeoutErrorCmd*(r: Redis | AsyncRedis, msg: string) =
+  when r is AsyncRedis:
+    let e = newTimeoutError(msg)
+    r.currentCommand = none(string)
+    failAllSendQueue(r, e)
+
+    r.pipeline.enabled = false
+    r.pipeline.expected = 0
+    r.pipeline.buffer = ""
+
+    try: r.socket.close()
+    except CatchableError: discard
+    raise e
+  else:
+    r.pipeline.enabled = false
+    r.pipeline.expected = 0
+    r.pipeline.buffer = ""
+
+    try: r.socket.close()
+    except CatchableError: discard
+    raiseTimeoutError(msg)
+
+proc raiseProtocolErrorCmd*(r: Redis | AsyncRedis, msg: string) =
+  when r is AsyncRedis:
+    let e = newProtocolError(msg)
+    r.currentCommand = none(string)
+    failAllSendQueue(r, e)
+
+    r.pipeline.enabled = false
+    r.pipeline.expected = 0
+    r.pipeline.buffer = ""
+
+    try: r.socket.close()
+    except CatchableError: discard
+    raise e
+  else:
+    r.pipeline.enabled = false
+    r.pipeline.expected = 0
+    r.pipeline.buffer = ""
+
+    try: r.socket.close()
+    except CatchableError: discard
+    raiseProtocolError(msg)
+
+# TODO: best attempt, currently cmd tracking is only reliable for Async non-pipelined commands
+# adding cmd tracking to pipeline.cmd and sync mode (last send cmd stored in Valkey?) would help here
+proc raiseResponseErrorCmd*(r: Redis | AsyncRedis, msg: string; code: string = ""; cmd: string = "") =
+  # capture cmd before finaliseCommand clears it (AsyncRedis only)
+  let cmd0 = if cmd.len != 0: cmd else: cmdName(r)
+  finaliseCommand(r)
+  raiseResponseError(msg, code = code, cmd = cmd0)
+
+proc raiseExecAbortErrorCmd*(r: Redis | AsyncRedis, msg: string; code: string = "EXECABORT"; cmd: string = "") =
+  # capture cmd before finaliseCommand clears it (AsyncRedis only)
+  let cmd0 = if cmd.len != 0: cmd else: cmdName(r)
+  finaliseCommand(r)
+  raiseExecAbortError(msg, code = code, cmd = cmd0)
+
+proc raiseValkeyErrorCmd*(r: Redis | AsyncRedis, msg: string) =
+  finaliseCommand(r)
+  raiseValkeyError(msg)
+
+proc raiseWatchErrorCmd*(r: Redis | AsyncRedis, msg: string) =
+  finaliseCommand(r)
+  raiseWatchError(msg)
 
 proc newPipeline(): Pipeline =
   new(result)
@@ -202,29 +377,50 @@ proc finaliseCommand(r: Redis | AsyncRedis) =
       fut.complete()
 
 proc raiseReplyError(r: Redis | AsyncRedis, msg: string) =
-  finaliseCommand(r)
-  raise newException(ReplyError, msg)
+  raiseProtocolErrorCmd(r, msg)
 
+proc respErrCode(msg: string): string =
+  var s  = msg.strip()
+  if s.len == 0: return ""
+
+  # error frames are "-<code> <message>"
+  if s[0] == '-':
+    if s.len == 1: return ""
+    s = s[1 .. ^1].strip()
+  let parts = s.splitWhitespace()
+  if parts.len == 0:
+    result = ""
+  else:
+    result = parts[0]
+
+# TODO: map common error codes to specific error types
 proc raiseRedisError(r: Redis | AsyncRedis, msg: string) =
-  finaliseCommand(r)
-  raise newException(RedisError, msg)
+  let code = respErrCode(msg)
+  if code == "EXECABORT":
+    raiseExecAbortErrorCmd(r, msg, code = code)
+  else:
+    raiseResponseErrorCmd(r, msg, code = code)
 
 proc managedSend(
-  r: Redis | AsyncRedis, data: string
+  r: Redis | AsyncRedis, data: string, cmd: string = ""
 ): Future[void] {.multisync.} =
   when r is Redis:
-    r.socket.send(data)
+    try:
+      r.socket.send(data)
+    except CatchableError as e:
+      raiseConnErrorCmd(r, "send failed: " & e.msg)
   else:
-    proc doSend() =
-      r.currentCommand = some(data)
-      asyncCheck r.socket.send(data)
     if r.currentCommand.isSome():
       # Queue this send.
       let sendFut = newFuture[void]("redis.managedSend")
       r.sendQueue.addLast(sendFut)
       await sendFut
 
-    doSend()
+    r.currentCommand = some(cmd)
+    try:
+      await r.socket.send(data)
+    except CatchableError as e:
+      raiseConnErrorCmd(r, "send failed: " & e.msg)
 
 proc managedRecv(
   r: Redis | AsyncRedis, size: int
@@ -233,11 +429,22 @@ proc managedRecv(
 
   when r is Redis:
     if r.socket.recv(result, size) != size:
-      raiseReplyError(r, "recv failed")
+      raiseConnErrorCmd(r, "recv failed")
   else:
     let numReceived = await r.socket.recvInto(addr result[0], size)
     if numReceived != size:
-      raiseReplyError(r, "recv failed")
+      raiseConnErrorCmd(r, "recv failed")
+
+proc managedRecvPubSub(r: Redis | AsyncRedis, size: int): Future[string] {.multisync.} =
+  ## Like managedRecv but doesn't finalise command state; raises ConnectionError on short read/EOF.
+  result = newString(size)
+  when r is Redis:
+    if r.socket.recv(result, size) != size:
+      raiseConnError("recv failed")
+  else:
+    let numReceived = await r.socket.recvInto(addr result[0], size)
+    if numReceived != size:
+      raiseConnError("recv failed")
 
 proc managedRecvLine(r: Redis | AsyncRedis): Future[string] {.multisync.} =
   if r.pipeline.enabled:
@@ -264,8 +471,8 @@ proc parseStatus(r: Redis | AsyncRedis, line: string = ""): RedisStatus =
   if r.pipeline.enabled:
     return "PIPELINED"
 
-  if line == "":
-    raiseRedisError(r, "Server closed connection prematurely")
+  if line.len == 0:
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
 
   if line[0] == '-':
     raiseRedisError(r, strip(line))
@@ -276,10 +483,9 @@ proc parseStatus(r: Redis | AsyncRedis, line: string = ""): RedisStatus =
 
 proc readStatus(r: Redis | AsyncRedis): Future[RedisStatus] {.multisync.} =
   let line = await r.managedRecvLine()
-
   if line.len == 0:
-    return "PIPELINED"
-
+    if r.pipeline.enabled: return "PIPELINED"
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
   result = r.parseStatus(line)
   finaliseCommand(r)
 
@@ -287,11 +493,11 @@ proc parseInteger(r: Redis | AsyncRedis, line: string = ""): RedisInteger =
   if r.pipeline.enabled:
     return -1
 
+  if line.len == 0:
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
+
   #if line == "+QUEUED":  # inside of multi
   #  return -1
-
-  if line == "":
-    raiseRedisError(r, "Server closed connection prematurely")
 
   if line[0] == '-':
     raiseRedisError(r, strip(line))
@@ -302,10 +508,21 @@ proc parseInteger(r: Redis | AsyncRedis, line: string = ""): RedisInteger =
   if parseBiggestInt(line, result, 1) == 0:
     raiseReplyError(r, "Unable to parse integer.")
 
+proc parseIntegerPubSub(line: string): RedisInteger =
+  if line.len == 0:
+    raiseConnError("Server closed connection prematurely")
+  if line[0] == '-':
+    raiseResponseError((strip(line)),code = respErrCode(line))
+  if line[0] != ':':
+    raiseProtocolError("Expected ':' at the beginning of an integer reply")
+  if parseBiggestInt(line, result, 1) == 0:
+    raiseProtocolError("Unable to parse integer: " & line)
+
 proc readInteger(r: Redis | AsyncRedis): Future[RedisInteger] {.multisync.} =
   let line = await r.managedRecvLine()
   if line.len == 0:
-    return -1
+    if r.pipeline.enabled: return -1
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
 
   result = r.parseInteger(line)
   finaliseCommand(r)
@@ -313,8 +530,10 @@ proc readInteger(r: Redis | AsyncRedis): Future[RedisInteger] {.multisync.} =
 proc readSingleString(
   r: Redis | AsyncRedis, line: string, allowMBNil: bool
 ): Future[Option[RedisString]] {.multisync.} =
-  if r.pipeline.enabled:
-    return
+  if r.pipeline.enabled: return none(RedisString)
+
+  if line.len == 0:
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
 
   # Error.
   if line[0] == '-':
@@ -328,7 +547,11 @@ proc readSingleString(
   if line[0] != '$':
     raiseInvalidReply(r, '$', line[0])
 
-  var numBytes = parseInt(line.substr(1))
+  var numBytes: int
+  try:
+    numBytes = parseInt(line.substr(1))
+  except ValueError:
+    raiseProtocolErrorCmd(r, "Unable to parse bulk string length " & line)
   if numBytes == -1:
     return
 
@@ -339,19 +562,52 @@ proc readSingleString(r: Redis | AsyncRedis): Future[RedisString] {.multisync.} 
   # TODO: Rename these style of procedures to `processSingleString`?
   let line = await r.managedRecvLine()
   if line.len == 0:
-    return ""
+    if r.pipeline.enabled: return ""
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
 
   let res = await r.readSingleString(line, allowMBNil = false)
   result = res.get(redisNil)
   finaliseCommand(r)
 
+proc readSingleStringPubSub(r: Redis | AsyncRedis, line: string, allowMBNil: bool): Future[Option[RedisString]] {.multisync.} =
+  if line.len == 0:
+    raiseConnError("Server closed connection prematurely")
+
+  # Error.
+  if line[0] == '-':
+    raiseResponseError(strip(line), code = respErrCode(line))
+
+  if allowMBNil and line == "$-1":
+    return none(RedisString)
+
+  if line[0] != '$':
+    raiseProtocolError("Expected '$' at the beginning of a bulk string reply got '" & $line[0] & "'")
+
+  var numBytes: int
+  try:
+    numBytes = parseInt(line.substr(1))
+  except ValueError:
+    raiseProtocolError("Unable to parse bulk string length " & line)
+
+  if numBytes == -1:
+    return none(RedisString)
+
+  var s = await r.managedRecvPubSub(numBytes + 2)
+  result = some(s[0 ..< numBytes]) # Strip \r\n
+
 proc readNext(r: Redis): RedisList {.gcsafe.}
 proc readNext(r: AsyncRedis): Future[RedisList] {.gcsafe.}
 proc readArrayLines(r: Redis | AsyncRedis, countLine: string): Future[RedisList] {.multisync.} =
+  if countLine.len == 0:
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
   if countLine[0] != '*':
     raiseInvalidReply(r, '*', countLine[0])
+  var numElems: int
+  try:
+    numElems = parseInt(countLine.substr(1))
+  except ValueError:
+    raiseProtocolErrorCmd(r, "Unable to parse array length " & countLine)
 
-  var numElems = parseInt(countLine.substr(1))
   result = @[]
 
   if numElems == -1:
@@ -370,48 +626,55 @@ proc readArrayLines(r: Redis | AsyncRedis, countLine: string): Future[RedisList]
 
 proc readPubSubElement(r: Redis | AsyncRedis; firstLine: string): Future[string] {.multisync, gcsafe.} =
   if firstLine.len == 0:
-    raiseReplyError(r, "pubsub connection closed")
+    raiseConnError("pubsub connection closed")
   case firstLine[0]
   of '+':
     # status: +PONG / +OK / etc
     return firstLine.substr(1)
   of '-':
-    raiseRedisError(r, strip(firstLine))
+    raiseResponseError(strip(firstLine), code = respErrCode(firstLine))
   of ':':
-    return $(r.parseInteger(firstLine))
+    return $(parseIntegerPubSub(firstLine))
   of '$':
-    let x = await r.readSingleString(firstLine, true)
+    let x = await r.readSingleStringPubSub(firstLine, true)
     return x.get(redisNil)
   of '*':
     # nested array: flatten with a delimiter or raise; Pub/Sub shouldn't have nested arrays
-    raiseReplyError(r, "Unexpected nested array in Pub/Sub element")
+    raiseProtocolError("Unexpected nested array in Pub/Sub message")
   else:
-    raiseReplyError(r, "readPubSubElement failed on line: " & firstLine)
+    raiseProtocolError("readPubSubElement failed on line: " & firstLine)
 
 proc readPubSubArrayLines(r: Redis | AsyncRedis; countLine: string):Future[RedisList] {.multisync, gcsafe.} =
-  if countLine.len == 0 or countLine[0] != '*':
-    raiseInvalidReply(r, '*', (if countLine.len == 0: '\0' else: countLine[0]))
-  let n = parseInt(countLine.substr(1))
+  if countLine.len == 0:
+    raiseConnError("pubsub connection closed")
+  if countLine[0] != '*':
+    raiseProtocolError("Expected '*' at the beginning of a Pub/Sub array reply got '" & $countLine[0] & "'")
+  var n: int
+  try:
+    n = parseInt(countLine.substr(1))
+  except ValueError:
+    raiseProtocolError("Unable to parse Pub/Sub array length " & countLine)
   result = @[]
   if n == -1:
-    return
+    raiseProtocolError("Unexpected nil array (*-1) in Pub/Sub frame")
   for _ in 0..<n:
     let line = await r.managedRecvLine()
     if line.len == 0:
-      raiseReplyError(r, "pubsub connection closed")
+      raiseConnError("pubsub connection closed")
     result.add(await r.readPubSubElement(line))
 
 proc readArrayLines(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   let line = await r.managedRecvLine()
   if line.len == 0:
-    return @[]
-
+    if r.pipeline.enabled: return @[]
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
   result = await r.readArrayLines(line)
 
 proc readBulkString(r: Redis | AsyncRedis, allowMBNil = false): Future[RedisString] {.multisync.} =
   let line = await r.managedRecvLine()
   if line.len == 0:
-    return ""
+    if r.pipeline.enabled: return ""
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
 
   let res = await r.readSingleString(line, allowMBNil)
   result = res.get(redisNil)
@@ -420,33 +683,31 @@ proc readBulkString(r: Redis | AsyncRedis, allowMBNil = false): Future[RedisStri
 proc readArray(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   let line = await r.managedRecvLine()
   if line.len == 0:
-    return @[]
+    if r.pipeline.enabled: return @[]
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
 
   result = await r.readArrayLines(line)
   finaliseCommand(r)
 
 proc readNext(r: Redis | AsyncRedis): Future[RedisList] {.multisync.} =
   let line = await r.managedRecvLine()
-
   if line.len == 0:
-    return @[]
+    if r.pipeline.enabled: return @[]
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
 
   # TODO: This is no longer an expression due to
   # https://github.com/nim-lang/Nim/issues/8399
-  var res: RedisList = @[]
   case line[0]
-  of '+', '-': res = @[r.parseStatus(line)]
-  of ':': res = @[$(r.parseInteger(line))]
+  of '*': return await r.readArrayLines(line)
   of '$':
-    let x = await r.readSingleString(line, true)
-    res = @[x.get(redisNil)]
-  of '*':
-    res = await r.readArrayLines(line)
+    let x = await r.readSingleString(line, allowMBNil = true)
+    return @[x.get(redisNil)]
+  of ':': return @[$(r.parseInteger(line))]
+  of '+': return @[line.substr(1)]
+  of '-':
+    raiseRedisError(r, strip(line))
   else:
-    raiseReplyError(r, "readNext failed on line: " & line)
-
-  r.pipeline.expected -= 1
-  return res
+    raiseProtocolErrorCmd(r, "readNext failed on line: " & line)
 
 # TODO: RESP2 only for now - RESP3 push support later
 proc readPubSubFrame*(r: Redis | AsyncRedis): Future[RedisList] {.multisync, gcsafe.} =
@@ -459,7 +720,7 @@ proc readPubSubFrame*(r: Redis | AsyncRedis): Future[RedisList] {.multisync, gcs
 
   ## In pubsub, returning @[] is ambiguous and empty lines should trigger disconnect/EOF.
   if line.len == 0:
-    raiseReplyError(r, "pubsub connection closed")
+    raiseConnError("pubsub connection closed")
 
 
   case line[0]
@@ -468,40 +729,161 @@ proc readPubSubFrame*(r: Redis | AsyncRedis): Future[RedisList] {.multisync, gcs
   of '+':
     return @[line.substr(1)]
   of '-':
-    raiseRedisError(r, strip(line))
+    raiseResponseError(strip(line), code = respErrCode(line))
   of ':':
-    return @[$(r.parseInteger(line))]
+    return @[$(parseIntegerPubSub(line))]
   of '$':
-    let x = await r.readSingleString(line, true)
+    let x = await r.readSingleStringPubSub(line, true)
     return @[x.get(redisNil)]
   else:
-    raiseReplyError(r, "readPubSubFrame failed on line: " & line)
+    raiseProtocolError("readPubSubFrame failed on line: " & line)
+
+proc drainRespFrame(r: Redis | AsyncRedis; firstLine = ""): Future[void] {.multisync.} =
+  ## consume one RESP2 frame from the socket
+  var line = firstLine
+  if line.len == 0:
+    line = await r.managedRecvLine() # if caller already read first line, pass the header line in
+  if line.len == 0:
+    raiseConnErrorCmd(r, "Server closed connection prematurely")
+  case line[0]
+  of '+', '-', ':': # status, error, integer (ie scalar)
+    discard
+  of '$': # bulk string
+    var n: int
+    try:
+      n = parseInt(line.substr(1))
+    except ValueError:
+      raiseProtocolErrorCmd(r, "Unable to parse bulk string length " & line)
+    if n>=0:
+      discard await r.managedRecv(n + 2) # payload + \r\n
+    # $-1 is nil bulk string, nothing to read
+  of '*': # array
+    var n: int 
+    try:
+      n = parseInt(line.substr(1))
+    except ValueError:
+      raiseProtocolErrorCmd(r, "Unable to parse array length " & line)
+    if n >= 0:
+      for _ in 0..<n:
+        await r.drainRespFrame()
+    # *-1 is nil array, nothing to read
+  else:
+    raiseProtocolErrorCmd(r, "Unknown RESP frame type: " & line)
 
 proc flushPipeline*(r: Redis | AsyncRedis, wasMulti = false): Future[RedisList] {.multisync.} =
   ## Send buffered commands, clear buffer, return results
-  if r.pipeline.buffer.len > 0:
-    await r.socket.send(r.pipeline.buffer)
-  r.pipeline.buffer = ""
+  ## After sending pipeline.buffer, exactly pipeline.expected top-level replies are read.
+  ##
+  ## Server reply error (ResponseError / ExecAbortError) are deferred until the remaining
+  ## replies are drained via drainRespFrame (no partial results are returned on error).
+  ##
+  ## Transport/protocol errors raise immediately.
+  ## TODO: consider a "collect all" variant that returns partial results and all errors.
+  when r is AsyncRedis:
+    ## Pipelined bypass managedSend() (which uses sendQueue),
+    ## so flushPipeline needs exclusive access to the connection.
+    if r.currentCommand.isSome() or r.sendQueue.len > 0:
+      raise newValkeyError("flushPipeline requires exclusive access to the connection")
 
+  if r.pipeline.buffer.len > 0:
+    when r is Redis:
+      try:
+        r.socket.send(r.pipeline.buffer)
+      except CatchableError as e:
+        raiseConnErrorCmd(r, "send failed: " & e.msg)
+    else:
+      try:
+        await r.socket.send(r.pipeline.buffer)
+      except CatchableError as e:
+        raiseConnErrorCmd(r, "send failed: " & e.msg)
+
+  # enter "read and reply" phase, clean buffer and disable pipelining
+  r.pipeline.buffer = ""
   r.pipeline.enabled = false
   result = @[]
 
-  var tot = r.pipeline.expected
+  # read replies
+  let tot = r.pipeline.expected
+  defer:
+    r.pipeline.expected = 0
 
-  for i in 0..tot-1:
-    var ret = await r.readNext()
-    for item in ret:
-     if not (item.contains("OK") or item.contains("QUEUED")):
-       result.add(item)
+  # remember first server error but keep draining so socket stays in sync
+  var firstServerError: ref Exception = nil
 
-  r.pipeline.expected = 0
+  # each iteration reads one reply except for multi/exec when command returns array
+  for i in 0..<tot:
+    if not firstServerError.isNil:
+      # if an error is already seen, drain only
+      await r.drainRespFrame()
+      continue
 
+    # EXEC reply
+    if wasMulti and i == tot - 1:
+      let line = await r.managedRecvLine()
+      if line.len == 0:
+        raiseConnErrorCmd(r, "Server closed connection prematurely")
+      if line == "*-1":
+        raiseWatchErrorCmd(r, "Transaction aborted (WATCH conflict)")
+      if line[0] == '-':
+        raiseRedisError(r, strip(line))
+      if line[0] != '*':
+        raiseProtocolErrorCmd(r, "Expected '*' at the beginning of an array reply got '" & $line[0] & "'")
+
+      # parse array
+      var n: int
+      try:
+        n = parseInt(line.substr(1))
+      except ValueError:
+        raiseProtocolErrorCmd(r, "Unable to parse array length " & line)
+
+      if n == -1:
+        raiseWatchErrorCmd(r, "Transaction aborted (WATCH conflict)")
+
+      # read n elements of the array
+      for _ in 0..<n:
+        if not firstServerError.isNil:
+          await r.drainRespFrame()
+          continue
+
+        try:
+          let elem = await r.readNext()
+          for item in elem:
+            result.add(item)
+        except ExecAbortError:
+          if firstServerError.isNil:
+            firstServerError = getCurrentException()
+        except ResponseError:
+          if firstServerError.isNil:
+            firstServerError = getCurrentException()
+
+    # normal reply
+    else:
+      try:
+        let ret = await r.readNext()
+        for item in ret:
+          if wasMulti and (item == "OK" or item == "QUEUED"):
+            discard
+          else:
+            result.add(item)
+      except ExecAbortError:
+        if firstServerError.isNil:
+          firstServerError = getCurrentException()
+      except ResponseError:
+        if firstServerError.isNil:
+          firstServerError = getCurrentException()
+
+  if not firstServerError.isNil:
+    raise firstServerError
+
+# TODO: Async pipelining/flushPipeline assumes execlusive access to the connection
+# not safe with concurrent commands. Futre: add per-connection IO lock or dedicated reader/writer task.
 proc startPipelining*(r: Redis | AsyncRedis) =
   ## Enable command pipelining (reduces network roundtrips).
   ## Note that when enabled, you must call flushPipeline to actually send commands, except
   ## for multi/exec() which enable and flush the pipeline automatically.
   ## Commands return immediately with dummy values; actual results returned from
   ## flushPipeline() or exec()
+  r.pipeline.buffer = "" # clear buffer so stale commands aren't sent
   r.pipeline.expected = 0
   r.pipeline.enabled = true
 
@@ -514,7 +896,7 @@ proc sendCommand(r: Redis | AsyncRedis, cmd: string): Future[void] {.multisync.}
     r.pipeline.buffer.add(request)
     r.pipeline.expected += 1
   else:
-    await r.managedSend(request)
+    await r.managedSend(request, cmd = cmd)
 
 proc sendCommand(
   r: Redis | AsyncRedis, cmd: string, args: seq[string]
@@ -530,7 +912,7 @@ proc sendCommand(
     r.pipeline.buffer.add(request)
     r.pipeline.expected += 1
   else:
-    await r.managedSend(request)
+    await r.managedSend(request, cmd = cmd)
 
 proc sendCommand(
   r: Redis | AsyncRedis, cmd: string, arg1: string
@@ -545,7 +927,7 @@ proc sendCommand(
     r.pipeline.expected += 1
     r.pipeline.buffer.add(request)
   else:
-    await r.managedSend(request)
+    await r.managedSend(request, cmd = cmd)
 
 proc sendCommand(r: Redis | AsyncRedis, cmd: string, arg1: string,
                  args: seq[string]): Future[void] {.multisync.} =
@@ -562,7 +944,7 @@ proc sendCommand(r: Redis | AsyncRedis, cmd: string, arg1: string,
     r.pipeline.expected += 1
     r.pipeline.buffer.add(request)
   else:
-    await r.managedSend(request)
+    await r.managedSend(request, cmd = cmd)
 
 # Keys
 
@@ -1285,6 +1667,13 @@ proc pubsub*(c: AsyncValkey; ignoreSubscribeMessages=false): AsyncPubSub =
   result.subscribed = false
   result.subscribedFut = newFuture[void]("pubsub.subscribed")
 
+proc resetState(ps: AsyncPubSub)
+proc close*(ps: AsyncPubSub): Future[void] {.async.}  # <-- add this forward decl
+proc requireConn(ps: AsyncPubSub): void =
+  ## Ensure that the Pub/Sub instance has a valid connection
+  if ps.conn.isNil:
+    raisePubSubError("pubsub connection not set: call subscribe/psubscribe/ping first")
+
 proc connectValkeyAsync*(host = "localhost", port = 6379.Port, db = 0,
                         username = "", password = ""): Future[AsyncValkey]
 
@@ -1314,7 +1703,17 @@ proc executeCommandImpl(ps: AsyncPubSub; argv: seq[string]): Future[void] {.asyn
   let req = encodeRespArray(argv)
   await ps.ensureConn()
   # IMPORTANT: bypass managedSend/SendCommand to avoid currentCommand/finalise coupling.
-  await ps.conn.socket.send(req) # send-only, no reads, no managedSend
+  try:
+    await ps.conn.socket.send(req) # send-only, no reads, no managedSend
+  except CatchableError as e:
+    if not ps.conn.isNil:
+      try:
+        ps.conn.socket.close()
+      except CatchableError:
+        discard
+      ps.conn = nil
+    ps.resetState()
+    raiseConnError("pubsub send failed: " & e.msg)
 
 proc executeCommand(ps: AsyncPubSub; argv: openArray[string]): Future[void] =
   # Execute with argv as is
@@ -1422,9 +1821,15 @@ proc sunsubscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
   return ps.executeCommand(argv)
 
 proc parseResponse*(ps: AsyncPubSub): Future[RedisList] {.async.} =
-  if ps.conn.isNil:
-    raise newException(PubSubError, "pubsub connection not set: did you forget to call a pubsub command (subscribe()/psubscribe()/ping())?")
-  return await ps.conn.readPubSubFrame()
+  ps.requireConn()
+  try:
+    return await ps.conn.readPubSubFrame()
+  except ConnectionError, ProtocolError:
+    try:
+      await ps.close()
+    except CatchableError:
+      discard
+    raise
 
 proc stringToKind(s: string): PubSubEventKind =
   case s.toLowerAscii()
@@ -1572,8 +1977,6 @@ proc handleMessage*(ps: AsyncPubSub; frame: RedisList; ignoreSubscribeMessages=f
 
 proc receiveEvent*(ps: AsyncPubSub; ignoreSubscribeMessages=false): Future[PubSubEvent] {.async.} =
   # raise error if connection is None
-  if ps.conn.isNil:
-    raise newException(PubSubError, "pubsub connection not set: did you forget to call a pubsub command (subscribe()/psubscribe()/ping())?")
   while true:
     let frame = await ps.parseResponse()
     let eventOpt = ps.handleMessage(frame, ignoreSubscribeMessages)

@@ -124,12 +124,45 @@ template syncTests() =
 
     check valkeyFlag or redisFlag
 
+  test "wrongtype raises ResponseError (sync)":
+    r.setk("redisTest:wrongType", "x")
+    try:
+      discard r.lPush("redisTest:wrongType", "y")
+      check false # should not reach here
+    except ResponseError as e:
+      check e.code == "WRONGTYPE"
+
   test "pipeline flush works":
     r.startPipelining()
     r.setk("pipelineTest:key1", "value1")
     discard r.get("pipelineTest:key1")
+    discard r.keys("pipelineTest:*")
     let replies = r.flushPipeline()
     check replies.contains("value1")
+    check replies.contains("pipelineTest:key1")
+
+    # pipeline should be reset
+    check r.get("pipelineTest:key1") == "value1"
+    let ks = r.keys("pipelineTest:*")
+    check ks.contains("pipelineTest:key1")
+
+  test "pipeline flush drains after server error":
+    r.startPipelining()
+    r.setk("pipelineTest:desync:key", "x")
+    discard r.lPush("pipelineTest:desync:key", "y")  # wrong type error
+    discard r.get("pipelineTest:desync:key")
+    discard r.incr("pipelineTest:desync:counter")
+
+    try:
+      discard r.flushPipeline()
+      check false # should not reach here
+    except ResponseError as e:
+      check e.code == "WRONGTYPE"
+
+    # if flushPipeline didn't drain, this get would read leftover "x" and fail
+    check r.get("pipelineTest:desync:counter") == "1"
+    check r.get("pipelineTest:desync:key") == "x"
+    check r.incr("pipelineTest:desync:counter") == 2
 
   # TODO: Ideally tests for all other procedures, will add these in the future
 
@@ -143,6 +176,19 @@ suite "valkey async tests":
   let r = waitFor connectTest(AsyncValkey)
   let keys = waitFor r.keys("*")
   doAssert keys.len == 0, "Don't want to mess up an existing DB."
+
+  test "wrongtype raises ResponseError (async)":
+    proc main(): Future[bool] {.async.} =
+      await r.setk("redisTestAsync:wrongType", "x")
+      try:
+        discard await r.lPush("redisTestAsync:wrongType", "y")
+        return false # should not reach here
+      except ResponseError as e:
+        check e.code == "WRONGTYPE"
+        check e.cmd.toUpperAscii() == "LPUSH"
+        return true
+
+    check waitFor main()
 
   test "issue #6":
     # See `tawaitorder` for a test that doesn't depend on Redis.
