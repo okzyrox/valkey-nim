@@ -64,7 +64,8 @@ type
     port*: Port
     username*: string
     password*: string
-    # TODO: include db / tls/ timeouts once reconnect is implemented
+    db*: int
+    # TODO: include tls/ timeouts once reconnect is implemented
 
   AsyncValkey* = ref object of ValkeyBase[asyncnet.AsyncSocket]
     ## An asynchronous valkey client.
@@ -334,6 +335,7 @@ proc open*(host = "localhost", port = 6379.Port): Redis =
 
   result.socket.connect(host, port)
 
+## TODO: consider storing conn params for unix sockets
 proc openUnix*(path = "/var/run/redis/redis.sock"): Redis =
   ## Open a synchronous unix connection to a valkey/redis server.
   result = Redis(
@@ -353,6 +355,7 @@ proc openAsync*(host = "localhost", port = 6379.Port): Future[AsyncRedis] {.asyn
   result.params = ValkeyConnParams(
     host: host,
     port: port,
+    db: 0,
     username: "",
     password: ""
   )
@@ -1680,10 +1683,10 @@ proc connectValkeyAsync*(host = "localhost", port = 6379.Port, db = 0,
 proc ensureConn(ps: AsyncPubSub): Future[void] {.async.} =
   ## Lazily create a AsyncValkey connection for the Pub/Sub instance
   if ps.conn.isNil:
-    # NOTE: db not in params yet; use default 0
     ps.conn = await connectValkeyAsync(
       host = ps.params.host,
       port = ps.params.port,
+      db = ps.params.db,
       username = ps.params.username,
       password = ps.params.password
     )
@@ -2166,7 +2169,7 @@ proc connectValkeyUnix*(path = "/var/run/valkey/valkey-server.sock", db = 0, use
 proc connectValkeyAsync*(host = "localhost", port = 6379.Port, db = 0, username = "", password = ""): Future[AsyncValkey] {.async.} =
   ## Open an asynchronous connection to a valkey server.
   let v = await openAsync(host, port)
-  v.params = ValkeyConnParams(host: host, port: port, username: username, password: password)
+  v.params = ValkeyConnParams(host: host, port: port, db: db, username: username, password: password)
   await v.setupValkeyConnection(db, username, password)
   result = v
 

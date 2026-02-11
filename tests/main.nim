@@ -13,12 +13,12 @@ proc connectTest*(T: typedesc[Valkey]): Valkey =
   else:
     result = connectValkey(host = "localhost")
 
-proc connectTest*(T: typedesc[AsyncValkey]): Future[AsyncValkey] {.async.} =
+proc connectTest*(T: typedesc[AsyncValkey], db: int = 0): Future[AsyncValkey] {.async.} =
   let pw = getValkeyPassword()
   if pw.len > 0:
-    result = await connectValkeyAsync(host = "localhost", password = pw)
+    result = await connectValkeyAsync(host = "localhost", db = db, password = pw)
   else:
-    result = await connectValkeyAsync(host = "localhost")
+    result = await connectValkeyAsync(host = "localhost", db = db)
 
 template syncTests() =
   let r = connectTest(Valkey)
@@ -257,8 +257,9 @@ suite "valkey async tests":
 
   test "check subscribe acks with pubsub lazy connection":
     proc main(): Future[bool] {.async.} =
-      let base = await connectTest(AsyncValkey)
+      let base = await connectTest(AsyncValkey, db = 3)
       let ps = base.pubsub(ignoreSubscribeMessages = false)
+      doAssert ps.params.db == 3
       doAssert ps.conn.isNil
 
       let ch = "test_pubsub_sub_ack"
@@ -266,6 +267,7 @@ suite "valkey async tests":
       # duplicates should be deduped to one subscribe ack
       await ps.subscribe(ch, ch, ch)
       doAssert ps.conn.isNil == false
+      doAssert ps.params.db == 3
 
       # until ack is consumed, subscribe should be false
       doAssert ps.subscribed == false
