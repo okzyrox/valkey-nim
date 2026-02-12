@@ -62,6 +62,35 @@ waitFor main()
 ```
 `receiveEvent()` returns the next Pub/Sub event (you can hide or show subscribe acknowledgements with `pubsub(ignoreSubscribeMessages=true/false)`). `receiveMessage()` is a wrapper that skips everything except published messages.
 
+### Pipelining (sync)
+
+When pipelining is enabled, commands are appended to an internal buffer instead of being sent immediately, which can reduce round-trip time. Nothing is sent to the server until the pipeline is flushed.
+
+When pipelining is active, you can keep calling commands as normal, but their return values should be treated as placeholders. Call `flushPipeline()` to send the buffered commands and return the responses as a `seq[string]` in command order.
+
+```nim
+import valkey
+
+let r = connectValkey()
+
+r.startPipelining()
+r.setk("k1", "a")
+r.setk("k2", "b")
+
+discard r.get("k1")  # placeholder while pipelining
+discard r.get("k2")  # placeholder while pipelining
+
+# Sends all queued commands, then reads exactly N replies in order:
+let replies = r.flushPipeline()
+
+# Example reply:
+# ["OK", "OK", "a", "b"]
+echo replies
+
+r.close()
+```
+If a command in the pipeline fails, `flushPipeline()` raises a `ResponseError`, but still drains the replies so the connection stays in sync.
+
 ## License
 
 Released under the MIT License, the same license as `nim-lang/redis` when this project was forked.
