@@ -1,4 +1,6 @@
-import valkey, unittest, asyncdispatch, os, strutils, options
+import valkey, unittest, asyncdispatch, os, strutils, options, std/sets
+
+const TestDb = 15
 
 proc getValkeyPassword(): string =
   let path = getHomeDir() / "valkey.creds"
@@ -6,14 +8,14 @@ proc getValkeyPassword(): string =
     return readFile(path).strip()
   return ""
 
-proc connectTest*(T: typedesc[Valkey]): Valkey =
+proc connectTest*(T: typedesc[Valkey], db: int = TestDb): Valkey =
   let pw = getValkeyPassword()
   if pw.len > 0:
-    result = connectValkey(host = "localhost", password = pw)
+    result = connectValkey(host = "localhost", db = db, password = pw)
   else:
-    result = connectValkey(host = "localhost")
+    result = connectValkey(host = "localhost", db = db)
 
-proc connectTest*(T: typedesc[AsyncValkey], db: int = 0): Future[AsyncValkey] {.async.} =
+proc connectTest*(T: typedesc[AsyncValkey], db: int = TestDb): Future[AsyncValkey] {.async.} =
   let pw = getValkeyPassword()
   if pw.len > 0:
     result = await connectValkeyAsync(host = "localhost", db = db, password = pw)
@@ -21,9 +23,10 @@ proc connectTest*(T: typedesc[AsyncValkey], db: int = 0): Future[AsyncValkey] {.
     result = await connectValkeyAsync(host = "localhost", db = db)
 
 template syncTests() =
+  doAssert TestDb != 0, "Don't want to mess up an existing DB."
   let r = connectTest(Valkey)
-  let keys = r.keys("*")
-  doAssert keys.len == 0, "Don't want to mess up an existing DB."
+  discard r.flushdb()
+  doAssert r.keys("*").len == 0
 
   test "simple set and get":
     const expected = "Hello, World!"
@@ -173,9 +176,10 @@ suite "valkey tests":
   syncTests()
 
 suite "valkey async tests":
+  doAssert TestDb != 0, "Don't want to mess up an existing DB."
   let r = waitFor connectTest(AsyncValkey)
-  let keys = waitFor r.keys("*")
-  doAssert keys.len == 0, "Don't want to mess up an existing DB."
+  discard waitFor r.flushdb()
+  doAssert (waitFor r.keys("*")).len == 0
 
   test "wrongtype raises ResponseError (async)":
     proc main(): Future[bool] {.async.} =
@@ -426,6 +430,8 @@ suite "valkey async tests":
       let ch1 = "test_unsub_1"
       let ch2 = "test_unsub_2"
 
+      doAssert len(ps.pendingUnsubChannels) == 0
+
       # waitSubscribed shouldn't be finished yet
       let subFut0 = ps.waitSubscribed()
       doAssert subFut0.finished == false
@@ -441,12 +447,17 @@ suite "valkey async tests":
       # consume ack 2
       discard await ps.receiveEvent()
 
-      await ps.unsubscribe(ch1)
+      await ps.unsubscribe(ch1, ch1) # duplicate unsubs should be deduped
+      doAssert ch1 in ps.pendingUnsubChannels
+      doAssert len(ps.pendingUnsubChannels) == 1
 
       let ev = await ps.receiveEvent()
       doAssert ev.kind == pekUnsubscribe
       doAssert ev.channel == ch1
       doAssert ev.count == 1
+      # once the ack is consumed, pending unsubs should be cleared
+      doAssert ch1 notin ps.pendingUnsubChannels
+      doAssert len(ps.pendingUnsubChannels) == 0
 
       # still subscribed to ch2
       doAssert ps.subscribed == true
@@ -456,11 +467,17 @@ suite "valkey async tests":
       doAssert subFut0.finished == true
       doAssert subFut1 == subFut0
 
-      await ps.unsubscribe(ch2)
+      # no-args unsubscription should unsubscribe from all channels
+      await ps.unsubscribe()
+      doAssert ch2 in ps.pendingUnsubChannels
+      doAssert len(ps.pendingUnsubChannels) == 1
+
       let ev2 = await ps.receiveEvent()
       doAssert ev2.kind == pekUnsubscribe
       doAssert ev2.channel == ch2
       doAssert ev2.count == 0
+      doAssert ch2 notin ps.pendingUnsubChannels
+      doAssert len(ps.pendingUnsubChannels) == 0
 
       doAssert ps.subscribed == false
 

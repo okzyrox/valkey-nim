@@ -1801,26 +1801,50 @@ proc ssubscribeImpl(ps: AsyncPubSub; channels: seq[string]): Future[void] {.asyn
 proc ssubscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
   return ps.ssubscribeImpl(@channels)
 
-# TODO: add pendingUnsub tracking and normalize/dedup
 proc unsubscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
   if channels.len == 0:
+    # unsubscribe from all currently known channels
+    for c in ps.channels:
+      ps.pendingUnsubChannels.incl(c)
     return ps.executeCommand("UNSUBSCRIBE")
-  var argv: seq[string] = @["UNSUBSCRIBE"]
-  for c in channels: argv.add c
+
+  let uniq = normalizeTargets(@channels, "UNSUBSCRIBE")
+  for c in uniq:
+    ps.pendingUnsubChannels.incl(c)
+
+  var argv = newSeqOfCap[string](1 + uniq.len)
+  argv.add "UNSUBSCRIBE"
+  for c in uniq: argv.add c
   return ps.executeCommand(argv)
 
 proc punsubscribe*(ps: AsyncPubSub; patterns: varargs[string]): Future[void] =
   if patterns.len == 0:
+    for p in ps.patterns:
+      ps.pendingUnsubPatterns.incl(p)
     return ps.executeCommand("PUNSUBSCRIBE")
-  var argv: seq[string] = @["PUNSUBSCRIBE"]
-  for p in patterns: argv.add p
+
+  let uniq = normalizeTargets(@patterns, "PUNSUBSCRIBE")
+  for p in uniq:
+    ps.pendingUnsubPatterns.incl(p)
+
+  var argv = newSeqOfCap[string](1 + uniq.len)
+  argv.add "PUNSUBSCRIBE"
+  for p in uniq: argv.add p
   return ps.executeCommand(argv)
 
 proc sunsubscribe*(ps: AsyncPubSub; channels: varargs[string]): Future[void] =
   if channels.len == 0:
+    for c in ps.shardChannels:
+      ps.pendingUnsubShardChannels.incl(c)
     return ps.executeCommand("SUNSUBSCRIBE")
-  var argv: seq[string] = @["SUNSUBSCRIBE"]
-  for c in channels: argv.add c
+
+  let uniq = normalizeTargets(@channels, "SUNSUBSCRIBE")
+  for c in uniq:
+    ps.pendingUnsubShardChannels.incl(c)
+
+  var argv = newSeqOfCap[string](1 + uniq.len)
+  argv.add "SUNSUBSCRIBE"
+  for c in uniq: argv.add c
   return ps.executeCommand(argv)
 
 proc parseResponse*(ps: AsyncPubSub): Future[RedisList] {.async.} =
