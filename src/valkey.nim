@@ -336,14 +336,15 @@ proc open*(host = "localhost", port = 6379.Port): Redis =
   result.socket.connect(host, port)
 
 ## TODO: consider storing conn params for unix sockets
-proc openUnix*(path = "/var/run/redis/redis.sock"): Redis =
-  ## Open a synchronous unix connection to a valkey/redis server.
-  result = Redis(
-    socket: newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false),
-    pipeline: newPipeline()
-  )
+when defined(linux):
+  proc openUnix*(path = "/var/run/redis/redis.sock"): Redis =
+    ## Open a synchronous unix connection to a valkey/redis server.
+    result = Redis(
+      socket: newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false),
+      pipeline: newPipeline()
+    )
 
-  result.socket.connectUnix(path)
+    result.socket.connectUnix(path)
 
 proc openAsync*(host = "localhost", port = 6379.Port): Future[AsyncRedis] {.async.} =
   ## Open an asynchronous connection to a valkey/redis server.
@@ -362,15 +363,16 @@ proc openAsync*(host = "localhost", port = 6379.Port): Future[AsyncRedis] {.asyn
 
   await result.socket.connect(host, port)
 
-proc openUnixAsync*(path = "/var/run/redis/redis.sock"): Future[AsyncRedis] {.async.} =
-  ## Open an asynchronous unix connection to a valkey/redis server.
-  result = AsyncRedis(
-    socket: newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false),
-    pipeline: newPipeline(),
-    sendQueue: initDeque[Future[void]]()
-  )
+when defined(linux):
+  proc openUnixAsync*(path = "/var/run/redis/redis.sock"): Future[AsyncRedis] {.async.} =
+    ## Open an asynchronous unix connection to a valkey/redis server.
+    result = AsyncRedis(
+      socket: newAsyncSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP, buffered = false),
+      pipeline: newPipeline(),
+      sendQueue: initDeque[Future[void]]()
+    )
 
-  await result.socket.connectUnix(path)
+    await result.socket.connectUnix(path)
 
 proc finaliseCommand(r: Redis | AsyncRedis) =
   when r is AsyncRedis:
@@ -2184,11 +2186,12 @@ proc connectValkey*(host = "localhost", port = 6379.Port, db = 0, username = "",
   v.setupValkeyConnection(db, username, password)
   result = v
 
-proc connectValkeyUnix*(path = "/var/run/valkey/valkey-server.sock", db = 0, username = "", password = ""): Valkey =
-  ## Open a synchronous unix connection to a valkey server.
-  let v = openUnix(path)
-  v.setupValkeyConnection(db, username, password)
-  result = v
+when defined(linux):
+  proc connectValkeyUnix*(path = "/var/run/valkey/valkey-server.sock", db = 0, username = "", password = ""): Valkey =
+    ## Open a synchronous unix connection to a valkey server.
+    let v = openUnix(path)
+    v.setupValkeyConnection(db, username, password)
+    result = v
 
 proc connectValkeyAsync*(host = "localhost", port = 6379.Port, db = 0, username = "", password = ""): Future[AsyncValkey] {.async.} =
   ## Open an asynchronous connection to a valkey server.
@@ -2197,11 +2200,12 @@ proc connectValkeyAsync*(host = "localhost", port = 6379.Port, db = 0, username 
   await v.setupValkeyConnection(db, username, password)
   result = v
 
-proc connectValkeyUnixAsync*(path = "/var/run/valkey/valkey-server.sock", db = 0, username = "", password = ""): Future[AsyncValkey] {.async.} =
-  ## Open an asynchronous unix connection to a valkey server.
-  let v = await openUnixAsync(path)
-  await v.setupValkeyConnection(db, username, password)
-  result = v
+when defined(linux):
+  proc connectValkeyUnixAsync*(path = "/var/run/valkey/valkey-server.sock", db = 0, username = "", password = ""): Future[AsyncValkey] {.async.} =
+    ## Open an asynchronous unix connection to a valkey server.
+    let v = await openUnixAsync(path)
+    await v.setupValkeyConnection(db, username, password)
+    result = v
 
 # Server
 
